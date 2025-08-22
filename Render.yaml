@@ -1,0 +1,23 @@
+services:
+  # Background Worker runs the trading loop
+  - type: worker
+    name: trader-worker
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python deepseek_binance_autotrader.py
+
+  # Web Service runs the analytics panel
+  - type: web
+    name: trader-panel
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn deepseek_binance_autotrader:start_panel --host 0.0.0.0 --port 10000
+    envVars:
+      - key: ANALYTICS_ENABLED
+        value: "true"
+      - key: ANALYTICS_HOST
+        value: "0.0.0.0"
+      - key: ANALYTICS_PORT
+        value: "10000"
