@@ -1,23 +1,40 @@
 services:
-  # Background Worker runs the trading loop
+  # Background worker: runs the trading loop (no web server here)
   - type: worker
     name: trader-worker
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python deepseek_binance_autotrader.py
+    envVars:
+      - key: ANALYTICS_ENABLED
+        value: "false"
+      - key: USE_TESTNET
+        value: "true"
+      # Add your secrets in the Render Dashboard (or here if you prefer)
+      # - key: DEEPSEEK_API_KEY
+      #   sync: false
+      # - key: BINANCE_API_KEY
+      #   sync: false
+      # - key: BINANCE_API_SECRET
+      #   sync: false
 
-  # Web Service runs the analytics panel
+  # Web service: serves the analytics panel at https://<name>.onrender.com
   - type: web
     name: trader-panel
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn deepseek_binance_autotrader:start_panel --host 0.0.0.0 --port 10000
+    startCommand: uvicorn panel:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: ANALYTICS_ENABLED
         value: "true"
-      - key: ANALYTICS_HOST
-        value: "0.0.0.0"
-      - key: ANALYTICS_PORT
-        value: "10000"
+      - key: USE_TESTNET
+        value: "true"
+      # Same note for secrets:
+      # - key: DEEPSEEK_API_KEY
+      #   sync: false
+      # - key: BINANCE_API_KEY
+      #   sync: false
+      # - key: BINANCE_API_SECRET
+      #   sync: false
