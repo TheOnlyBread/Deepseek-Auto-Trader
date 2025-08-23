@@ -1,6 +1,6 @@
 # deepseek_binance_autotrader.py
 # Render-ready: Worker runs this file; Web runs panel.py (panel:app)
-# Deps: requests, python-dotenv, tenacity, pandas, numpy, fastapi, uvicorn
+# Deps: requests, python-dotenv, tenacity, pandas, numpy, fastapi, uvicorn, psycopg[binary]
 
 import os
 import time
@@ -8,7 +8,6 @@ import hmac
 import hashlib
 import json
 import math
-import sqlite3
 import threading
 from threading import Thread, Lock
 from dataclasses import dataclass
@@ -53,8 +52,7 @@ SIZE_SCALE_MAX = float(os.getenv("SIZE_SCALE_MAX", "1.25"))
 # Analytics panel (Worker should set ANALYTICS_ENABLED=false on Render)
 ANALYTICS_ENABLED = os.getenv("ANALYTICS_ENABLED", "false").lower() == "true"
 ANALYTICS_HOST = os.getenv("ANALYTICS_HOST", "0.0.0.0")
-ANALYTICS_PORT = int(os.getenv("ANALYTICS_PORT", "10000"))  # Render web service uses $PORT; worker ignores panel
-DB_PATH = os.getenv("DB_PATH", "trader.db")
+ANALYTICS_PORT = int(os.getenv("ANALYTICS_PORT", "10000"))
 
 # ROI model (assumptions you control)
 EQUITY_USDT = float(os.getenv("EQUITY_USDT", "1000"))
@@ -88,6 +86,7 @@ def _ts_ms() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
 def _hmac_sha256(secret: str, msg: str) -> str:
+    import hashlib, hmac
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def as_float(x, default=np.nan):
@@ -124,48 +123,124 @@ def pct_rank(x: np.ndarray, v: float) -> float:
     return float((x <= v).sum()) / float(len(x))
 
 # --------------------------
-# SQLite logging (ephemeral on Render free; switch to Postgres for persistence)
+# Database adapter (SQLite for local, Postgres on Render if DATABASE_URL set)
 # --------------------------
+import sqlite3
+import contextlib
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_PG = DATABASE_URL != ""
+
+if USE_PG:
+    import psycopg
+
+@contextlib.contextmanager
+def db_conn():
+    if USE_PG:
+        conn = psycopg.connect(DATABASE_URL, autocommit=True)
+        try:
+            yield conn
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect("trader.db")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
 def db_init():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS decisions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts REAL, symbol TEXT, price REAL,
-        llm_signal TEXT, confidence REAL,
-        gated_signal TEXT, sl_pct REAL, tp_pct REAL,
-        regime_json TEXT
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS trades(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_open REAL, symbol TEXT, side TEXT, qty REAL,
-        entry_price REAL, sl_price REAL, tp_price REAL,
-        ts_close REAL, close_price REAL, realized_pnl REAL, exit_reason TEXT
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS regime(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts REAL, features_json TEXT, info_json TEXT
-    );""")
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if USE_PG:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS decisions(
+                id SERIAL PRIMARY KEY,
+                ts DOUBLE PRECISION, symbol TEXT, price DOUBLE PRECISION,
+                llm_signal TEXT, confidence DOUBLE PRECISION,
+                gated_signal TEXT, sl_pct DOUBLE PRECISION, tp_pct DOUBLE PRECISION,
+                regime_json TEXT
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades(
+                id SERIAL PRIMARY KEY,
+                ts_open DOUBLE PRECISION, symbol TEXT, side TEXT, qty DOUBLE PRECISION,
+                entry_price DOUBLE PRECISION, sl_price DOUBLE PRECISION, tp_price DOUBLE PRECISION,
+                ts_close DOUBLE PRECISION, close_price DOUBLE PRECISION, realized_pnl DOUBLE PRECISION, exit_reason TEXT
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS regime(
+                id SERIAL PRIMARY KEY,
+                ts DOUBLE PRECISION, features_json TEXT, info_json TEXT
+            );
+            """)
+        else:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS decisions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, symbol TEXT, price REAL,
+                llm_signal TEXT, confidence REAL,
+                gated_signal TEXT, sl_pct REAL, tp_pct REAL,
+                regime_json TEXT
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS trades(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_open REAL, symbol TEXT, side TEXT, qty REAL,
+                entry_price REAL, sl_price REAL, tp_price REAL,
+                ts_close REAL, close_price REAL, realized_pnl REAL, exit_reason TEXT
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS regime(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, features_json TEXT, info_json TEXT
+            );
+            """)
+            conn.commit()
 
 def db_insert(table: str, row: dict):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cols = ",".join(row.keys())
-    q = ",".join(["?"]*len(row))
-    cur.execute(f"INSERT INTO {table} ({cols}) VALUES ({q})", list(row.values()))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cols = list(row.keys())
+        vals = list(row.values())
+        col_sql = ",".join(cols)
+        if USE_PG:
+            placeholders = ",".join(["%s"]*len(cols))
+            cur.execute(f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders});", vals)
+        else:
+            placeholders = ",".join(["?"]*len(cols))
+            cur.execute(f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders});", vals)
+            conn.commit()
 
 def db_update_trade_close(trade_id: int, ts_close: float, close_price: float, realized_pnl: Optional[float], reason: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""UPDATE trades
-                   SET ts_close=?, close_price=?, realized_pnl=?, exit_reason=?
-                   WHERE id=?""", (ts_close, close_price, realized_pnl, reason, trade_id))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if USE_PG:
+            cur.execute(
+                "UPDATE trades SET ts_close=%s, close_price=%s, realized_pnl=%s, exit_reason=%s WHERE id=%s;",
+                (ts_close, close_price, realized_pnl, reason, trade_id)
+            )
+        else:
+            cur.execute(
+                "UPDATE trades SET ts_close=?, close_price=?, realized_pnl=?, exit_reason=? WHERE id=?;",
+                (ts_close, close_price, realized_pnl, reason, trade_id)
+            )
+            conn.commit()
+
+def db_select_rows(sql_sqlite: str, sql_pg: str, params: tuple = ()):
+    """Run a SELECT that differs only in placeholders between sqlite ('?') and postgres ('%s')."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if USE_PG:
+            cur.execute(sql_pg, params)
+        else:
+            cur.execute(sql_sqlite, params)
+        rows = cur.fetchall()
+    return rows
 
 # --------------------------
 # Binance Futures client
@@ -220,11 +295,8 @@ class BinanceFutures:
         cur = start_ms
         while cur < end_ms:
             params = {
-                "symbol": symbol,
-                "interval": interval,
-                "limit": step_limit,
-                "startTime": cur,
-                "endTime": min(cur + itv * step_limit, end_ms)
+                "symbol": symbol, "interval": interval, "limit": step_limit,
+                "startTime": cur, "endTime": min(cur + itv * step_limit, end_ms)
             }
             chunk = self._request("GET", "/fapi/v1/klines", params)
             if not chunk:
@@ -609,10 +681,12 @@ class AutoTrader:
             "entry_price": price, "sl_price": sl_price, "tp_price": tp_price,
             "ts_close": None, "close_price": None, "realized_pnl": None, "exit_reason": None
         })
-        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
-        cur.execute("SELECT id FROM trades ORDER BY id DESC LIMIT 1;")
-        row = cur.fetchone(); conn.close()
-        self.active_trade_id = int(row[0]) if row else None
+        rows = db_select_rows(
+            "SELECT id FROM trades ORDER BY id DESC LIMIT 1;",
+            "SELECT id FROM trades ORDER BY id DESC LIMIT 1;",
+            ()
+        )
+        self.active_trade_id = int(rows[0][0]) if rows else None
 
     def _close_if_timeout(self, current_price: float):
         if self.position_open_time and time.time() - self.position_open_time > MAX_OPEN_SECONDS:
@@ -621,7 +695,7 @@ class AutoTrader:
                 side = "SELL" if amt > 0 else "BUY"
                 self.b.cancel_all(self.symbol)
                 self.b.new_order(symbol=self.symbol, side=side, type="MARKET",
-                                 quantity=f"{abs(quantize_qty(abs(amt), self.filters.step_size, self.filters.min_qty))}")
+                                 quantity=f"{abs(amt)}")
                 print("[Panic] Closed due to MAX_OPEN_SECONDS")
                 self._finalize_trade("timeout", current_price)
 
@@ -650,7 +724,7 @@ class AutoTrader:
         kl = self.b.klines(self.symbol, INTERVAL, limit=KLIMIT)
         if not kl or len(kl) < 50:
             raise LogicSkip("Not enough bars")
-        df, feat = build_features(kl)
+        _, feat = build_features(kl)
         price = feat["price"]
 
         self._close_if_timeout(price)
@@ -700,6 +774,8 @@ class AutoTrader:
         print(f"[Bot] Testnet={USE_TESTNET} | Symbol={self.symbol} | Lev={LEVERAGE} | Notional={NOTIONAL_PER_TRADE_USDT} USDT")
         print(f"[Regime] Lookback={REGIME_LOOKBACK_DAYS}d @ {REGIME_INTERVAL} | Refresh={REGIME_REFRESH_MINUTES}m | Gates={USE_HYBRID_GATES}")
         print("[Bot] Running. Ctrl+C to stop.")
+        b2 = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
+        self.d = DeepSeek(DEEPSEEK_API_KEY)
         while True:
             try:
                 self.step()
@@ -724,15 +800,14 @@ class AutoTrader:
 # Analytics Panel (ASGI app builder + optional local runner)
 # --------------------------
 def build_panel_app():
-    """
-    Returns a FastAPI app instance without starting uvicorn.
-    Render's Web Service imports panel:app from panel.py
-    """
+    from fastapi import FastAPI
+    from fastapi.responses import HTMLResponse, JSONResponse
+
+    # Ensure tables exist (web and worker are separate containers)
     try:
-        from fastapi import FastAPI
-        from fastapi.responses import HTMLResponse, JSONResponse
+        db_init()
     except Exception as e:
-        raise RuntimeError("FastAPI not installed; add it to requirements.txt") from e
+        print(f"[Panel] db_init warning: {e}")
 
     app = FastAPI()
 
@@ -801,8 +876,6 @@ setInterval(load, 4000); load();
 </body></html>
     """
 
-    app.state._db_path = DB_PATH  # for clarity if needed
-
     def _balances():
         try:
             b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
@@ -849,7 +922,7 @@ setInterval(load, 4000); load();
         cpu_needs = "1 vCPU / 512MB is fine; use 2 vCPU / 1–2GB for more symbols or 10–15s loop."
         return {"year_bars": year_bars, "mem_mb": mem_mb, "cpu_needs": cpu_needs}
 
-    app.DASH = DASH  # expose if needed by tests
+    app.DASH = DASH
 
     @app.get("/", response_class=HTMLResponse)
     def home():
@@ -857,20 +930,33 @@ setInterval(load, 4000); load();
 
     @app.get("/api/decisions")
     def api_decisions(limit: int = 50):
-        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
-        cur.execute("SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT ?;", (limit,))
-        rows = [{"ts": r[0], "price": r[1], "llm_signal": r[2], "confidence": r[3], "gated_signal": r[4]} for r in cur.fetchall()]
-        conn.close()
-        return JSONResponse({"rows": rows})
+        try:
+            rows = db_select_rows(
+                "SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT ?;",
+                "SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT %s;",
+                (limit,)
+            )
+            rows = [{"ts": r[0], "price": r[1], "llm_signal": r[2], "confidence": r[3], "gated_signal": r[4]} for r in rows]
+            return JSONResponse({"rows": rows})
+        except Exception as e:
+            print(f"[Panel] decisions query: {e}")
+            return JSONResponse({"rows": []})
 
     @app.get("/api/regime")
     def api_regime():
-        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
-        cur.execute("SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;")
-        row = cur.fetchone(); conn.close()
-        if not row:
+        try:
+            rows = db_select_rows(
+                "SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;",
+                "SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;",
+                ()
+            )
+            if not rows:
+                return JSONResponse({})
+            row = rows[0]
+            return JSONResponse({"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])})
+        except Exception as e:
+            print(f"[Panel] regime query: {e}")
             return JSONResponse({})
-        return JSONResponse({"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])})
 
     @app.get("/api/status")
     def api_status():
@@ -895,36 +981,28 @@ setInterval(load, 4000); load();
 
 
 def start_panel():
-    """
-    Local dev convenience: build the FastAPI app and run uvicorn directly.
-    DO NOT use this entrypoint on Render. Use panel.py (panel:app) instead.
-    """
+    """Local dev convenience. On Render, use panel.py (panel:app)."""
     import uvicorn
     app = build_panel_app()
-    host = os.getenv("ANALYTICS_HOST", "0.0.0.0")
-    port = int(os.getenv("ANALYTICS_PORT", "10000"))
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run(app, host=ANALYTICS_HOST, port=ANALYTICS_PORT, log_level="warning")
 
 # --------------------------
 # Main (Worker entrypoint)
 # --------------------------
 def main():
     if not (DEEPSEEK_API_KEY and BINANCE_API_KEY and BINANCE_API_SECRET):
-        print("Missing keys in .env (DEEPSEEK_API_KEY, BINANCE_API_KEY, BINANCE_API_SECRET).")
+        print("Missing keys (DEEPSEEK_API_KEY, BINANCE_API_KEY, BINANCE_API_SECRET).")
         return
 
-    db_init()
+    db_init()  # ensure tables for the worker
 
-    # Worker MUST NOT run the panel on Render; set ANALYTICS_ENABLED=false in worker service.
     if ANALYTICS_ENABLED:
-        # Local dev only: start panel in a side thread
-        t = Thread(target=start_panel, daemon=True)
-        t.start()
+        # local dev only
+        Thread(target=start_panel, daemon=True).start()
 
     b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
     d = DeepSeek(DEEPSEEK_API_KEY)
-    bot = AutoTrader(b, d, SYMBOL)
-    bot.loop()
+    AutoTrader(b, d, SYMBOL).loop()
 
 if __name__ == "__main__":
     main()
