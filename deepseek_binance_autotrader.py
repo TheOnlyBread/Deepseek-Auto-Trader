@@ -1,5 +1,7 @@
 # deepseek_binance_autotrader.py
-# Dependencies: requests, python-dotenv, tenacity, pandas, numpy, fastapi, uvicorn
+# Render-ready: Worker runs this file; Web runs panel.py (panel:app)
+# Deps: requests, python-dotenv, tenacity, pandas, numpy, fastapi, uvicorn
+
 import os
 import time
 import hmac
@@ -48,10 +50,10 @@ USE_HYBRID_GATES = os.getenv("USE_HYBRID_GATES", "true").lower() == "true"
 SIZE_SCALE_MIN = float(os.getenv("SIZE_SCALE_MIN", "0.35"))
 SIZE_SCALE_MAX = float(os.getenv("SIZE_SCALE_MAX", "1.25"))
 
-# Analytics panel
-ANALYTICS_ENABLED = os.getenv("ANALYTICS_ENABLED", "true").lower() == "true"
+# Analytics panel (Worker should set ANALYTICS_ENABLED=false on Render)
+ANALYTICS_ENABLED = os.getenv("ANALYTICS_ENABLED", "false").lower() == "true"
 ANALYTICS_HOST = os.getenv("ANALYTICS_HOST", "0.0.0.0")
-ANALYTICS_PORT = int(os.getenv("ANALYTICS_PORT", "8080"))
+ANALYTICS_PORT = int(os.getenv("ANALYTICS_PORT", "10000"))  # Render web service uses $PORT; worker ignores panel
 DB_PATH = os.getenv("DB_PATH", "trader.db")
 
 # ROI model (assumptions you control)
@@ -122,7 +124,7 @@ def pct_rank(x: np.ndarray, v: float) -> float:
     return float((x <= v).sum()) / float(len(x))
 
 # --------------------------
-# SQLite logging
+# SQLite logging (ephemeral on Render free; switch to Postgres for persistence)
 # --------------------------
 def db_init():
     conn = sqlite3.connect(DB_PATH)
@@ -144,10 +146,6 @@ def db_init():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts REAL, features_json TEXT, info_json TEXT
     );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS metrics(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts REAL, key TEXT, value REAL
-    );""")
     conn.commit()
     conn.close()
 
@@ -160,7 +158,7 @@ def db_insert(table: str, row: dict):
     conn.commit()
     conn.close()
 
-def db_update_trade_close(trade_id: int, ts_close: float, close_price: float, realized_pnl: float, reason: str):
+def db_update_trade_close(trade_id: int, ts_close: float, close_price: float, realized_pnl: Optional[float], reason: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""UPDATE trades
@@ -275,7 +273,6 @@ class BinanceFutures:
         return self._request("GET", "/fapi/v1/income", p, signed=True)
 
     def balances(self):
-        # /fapi/v2/balance -> list of assets with balance
         return self._request("GET", "/fapi/v2/balance", signed=True)
 
 # --------------------------
@@ -607,13 +604,11 @@ class AutoTrader:
                          stopPrice=f"{tp_price}", closePosition="true", workingType=RISK_WORKING_TYPE)
         print(f"[Exits] SL {sl_side} @{sl_price} | TP {tp_side} @{tp_price}")
 
-        # log trade open
         db_insert("trades", {
             "ts_open": time.time(), "symbol": self.symbol, "side": side, "qty": qty,
             "entry_price": price, "sl_price": sl_price, "tp_price": tp_price,
             "ts_close": None, "close_price": None, "realized_pnl": None, "exit_reason": None
         })
-        # fetch last inserted id
         conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
         cur.execute("SELECT id FROM trades ORDER BY id DESC LIMIT 1;")
         row = cur.fetchone(); conn.close()
@@ -628,13 +623,11 @@ class AutoTrader:
                 self.b.new_order(symbol=self.symbol, side=side, type="MARKET",
                                  quantity=f"{abs(quantize_qty(abs(amt), self.filters.step_size, self.filters.min_qty))}")
                 print("[Panic] Closed due to MAX_OPEN_SECONDS")
-                # approximate pnl using marked close
                 self._finalize_trade("timeout", current_price)
 
     def _finalize_trade(self, reason: str, close_price: float):
         if self.active_trade_id is None:
             return
-        # Get realized PnL from income history last 24h (best effort)
         realized = None
         try:
             since = int((datetime.now(tz=timezone.utc) - timedelta(days=1)).timestamp() * 1000)
@@ -654,31 +647,25 @@ class AutoTrader:
         self.position_open_time = None
 
     def step(self):
-        # Pull short-term klines/features
         kl = self.b.klines(self.symbol, INTERVAL, limit=KLIMIT)
         if not kl or len(kl) < 50:
             raise LogicSkip("Not enough bars")
         df, feat = build_features(kl)
         price = feat["price"]
 
-        # Timeout safeguard
         self._close_if_timeout(price)
 
-        # If position active, do nothing (exits armed)
         if abs(self._flat_position_amt()) > 0:
             raise LogicSkip("Position active; waiting")
 
-        # Regime snapshot
         snap = self.regime.get_snapshot()
         if not snap:
             raise LogicSkip("Regime snapshot not ready")
 
-        # Merge features
         all_feat = {**feat}
         for k, v in snap.features.items():
             all_feat[f"X_{k}"] = float(v)
 
-        # DeepSeek decision
         decision = self.d.decide(all_feat)
         sig = decision["signal"]
         conf = decision["confidence"]
@@ -687,7 +674,6 @@ class AutoTrader:
 
         gated_sig = self._hybrid_gate(sig, snap.features)
 
-        # Log decision -> DB
         db_insert("decisions", {
             "ts": time.time(), "symbol": self.symbol, "price": price,
             "llm_signal": sig, "confidence": conf, "gated_signal": gated_sig,
@@ -705,11 +691,9 @@ class AutoTrader:
         dyn_notional = self._dynamic_notional(NOTIONAL_PER_TRADE_USDT, snap.features)
         self._place_entry_and_exits(gated_sig, price, slp, tpp, notional_override=dyn_notional)
 
-        # brief pause; then cleanup if instantly flat
         time.sleep(1)
         self._cleanup_if_flat()
         if abs(self._flat_position_amt()) < 1e-12 and self.active_trade_id is not None:
-            # likely closed by immediate SL/TP; mark approximate close
             self._finalize_trade("instant_exit", price)
 
     def loop(self):
@@ -737,16 +721,18 @@ class AutoTrader:
             time.sleep(DECISION_COOLDOWN_SEC)
 
 # --------------------------
-# Analytics Panel (FastAPI)
+# Analytics Panel (ASGI app builder + optional local runner)
 # --------------------------
-def start_panel():
+def build_panel_app():
+    """
+    Returns a FastAPI app instance without starting uvicorn.
+    Render's Web Service imports panel:app from panel.py
+    """
     try:
         from fastapi import FastAPI
         from fastapi.responses import HTMLResponse, JSONResponse
-        import uvicorn
-    except Exception:
-        print("[Panel] FastAPI/uvicorn not installed. Set ANALYTICS_ENABLED=false or install deps.")
-        return
+    except Exception as e:
+        raise RuntimeError("FastAPI not installed; add it to requirements.txt") from e
 
     app = FastAPI()
 
@@ -764,18 +750,9 @@ h1{margin:0 0 12px 0} table{width:100%;border-collapse:collapse} th,td{padding:8
 </head><body>
 <h1>DeepSeek × Binance AutoTrader</h1>
 <div class="grid">
-  <div class="card">
-    <h3>Status</h3>
-    <div id="status"></div>
-  </div>
-  <div class="card">
-    <h3>ROI Model (assumptions)</h3>
-    <div id="roi"></div>
-  </div>
-  <div class="card">
-    <h3>Resource Estimate</h3>
-    <div id="res"></div>
-  </div>
+  <div class="card"><h3>Status</h3><div id="status"></div></div>
+  <div class="card"><h3>ROI Model (assumptions)</h3><div id="roi"></div></div>
+  <div class="card"><h3>Resource Estimate</h3><div id="res"></div></div>
 </div>
 <div class="card">
   <h3>Latest Decisions</h3>
@@ -786,7 +763,6 @@ h1{margin:0 0 12px 0} table{width:100%;border-collapse:collapse} th,td{padding:8
   <pre id="regime" style="white-space:pre-wrap"></pre>
 </div>
 <script>
-async function fmt(ts){const d=new Date(ts*1000);return d.toLocaleString()}
 async function load(){
   const s = await fetch('/api/status').then(r=>r.json());
   const r = await fetch('/api/roi').then(r=>r.json());
@@ -802,7 +778,7 @@ async function load(){
      <div><span class="badge">24h Realized PnL</span> ${s.pnl24h}</div>`;
   document.getElementById('roi').innerHTML =
     `<div><b>Exp. Daily PnL</b>: ${r.expected_daily_pnl_usdt.toFixed(2)} USDT</div>
-     <div>Trades/Day: ${r.trades_per_day}, Win%: ${Math.round(r.win_rate*100)}%, AvgWinR: ${r.avg_win_r}, AvgLossR: ${r.avg_loss_r}, Risk/Trade: ${r.risk_per_trade}</div>
+     <div>Trades/Day: ${r.trades_per_day}, Win%: ${(r.win_rate*100).toFixed(0)}%, AvgWinR: ${r.avg_win_r}, AvgLossR: ${r.avg_loss_r}, Risk/Trade: ${r.risk_per_trade}</div>
      <div><b>Exp. Daily ROI</b>: ${(r.expected_daily_roi*100).toFixed(2)}%</div>`;
   document.getElementById('res').innerHTML =
     `<div>Yearly bars (1h): ${re.year_bars}</div>
@@ -825,26 +801,7 @@ setInterval(load, 4000); load();
 </body></html>
     """
 
-    @app.get("/", response_class=HTMLResponse)
-    def home():
-        return HTMLResponse(DASH)
-
-    @app.get("/api/decisions")
-    def api_decisions(limit: int = 50):
-        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
-        cur.execute("SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT ?;", (limit,))
-        rows = [{"ts": r[0], "price": r[1], "llm_signal": r[2], "confidence": r[3], "gated_signal": r[4]} for r in cur.fetchall()]
-        conn.close()
-        return JSONResponse({"rows": rows})
-
-    @app.get("/api/regime")
-    def api_regime():
-        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
-        cur.execute("SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;")
-        row = cur.fetchone(); conn.close()
-        if not row:
-            return JSONResponse({})
-        return JSONResponse({"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])})
+    app.state._db_path = DB_PATH  # for clarity if needed
 
     def _balances():
         try:
@@ -871,7 +828,6 @@ setInterval(load, 4000); load();
             return None
 
     def _roi_model():
-        # Expected Value per trade (USDT)
         ev_trade = ROI_WIN_RATE * (ROI_AVG_WIN_R * ROI_RISK_PER_TRADE_USDT) - (1 - ROI_WIN_RATE) * (ROI_AVG_LOSS_R * ROI_RISK_PER_TRADE_USDT)
         daily_pnl = ev_trade * ROI_TRADES_PER_DAY
         daily_roi = daily_pnl / max(1.0, EQUITY_USDT)
@@ -886,13 +842,35 @@ setInterval(load, 4000); load();
         }
 
     def _resources():
-        # 1 year of 1h bars ~ 8760; two symbols; ~10 columns of float64
         year_bars = 8760
         cols = 10
-        bytes_per = year_bars * cols * 8 * 2  # 2 symbols
+        bytes_per = year_bars * cols * 8 * 2
         mem_mb = bytes_per / (1024**2)
-        cpu_needs = "1 vCPU shared, 512MB RAM is sufficient; 2 vCPU / 1GB for more symbols or 15s loop."
+        cpu_needs = "1 vCPU / 512MB is fine; use 2 vCPU / 1–2GB for more symbols or 10–15s loop."
         return {"year_bars": year_bars, "mem_mb": mem_mb, "cpu_needs": cpu_needs}
+
+    app.DASH = DASH  # expose if needed by tests
+
+    @app.get("/", response_class=HTMLResponse)
+    def home():
+        return HTMLResponse(DASH)
+
+    @app.get("/api/decisions")
+    def api_decisions(limit: int = 50):
+        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+        cur.execute("SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT ?;", (limit,))
+        rows = [{"ts": r[0], "price": r[1], "llm_signal": r[2], "confidence": r[3], "gated_signal": r[4]} for r in cur.fetchall()]
+        conn.close()
+        return JSONResponse({"rows": rows})
+
+    @app.get("/api/regime")
+    def api_regime():
+        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+        cur.execute("SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;")
+        row = cur.fetchone(); conn.close()
+        if not row:
+            return JSONResponse({})
+        return JSONResponse({"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])})
 
     @app.get("/api/status")
     def api_status():
@@ -913,26 +891,22 @@ setInterval(load, 4000); load();
     def api_resources():
         return _resources()
 
-    def _run():
-        uvicorn.run(app, host=ANALYTICS_HOST, port=ANALYTICS_PORT, log_level="warning")
+    return app
 
-    t = Thread(target=_run, daemon=True)
-    t.start()
-    print(f"[Panel] http://{ANALYTICS_HOST}:{ANALYTICS_PORT}")
 
-# --------------------------
-# Resource Estimator (console print)
-# --------------------------
-def print_resources_summary():
-    year_bars = 8760
-    cols = 10
-    bytes_per = year_bars * cols * 8 * 2
-    mem_mb = bytes_per / (1024**2)
-    print(f"[Resources] ~{mem_mb:.2f} MB for yearly regime data; CPU: 1 vCPU/512MB OK; "
-          f"for faster loops or more symbols consider 2 vCPU/1GB+")
+def start_panel():
+    """
+    Local dev convenience: build the FastAPI app and run uvicorn directly.
+    DO NOT use this entrypoint on Render. Use panel.py (panel:app) instead.
+    """
+    import uvicorn
+    app = build_panel_app()
+    host = os.getenv("ANALYTICS_HOST", "0.0.0.0")
+    port = int(os.getenv("ANALYTICS_PORT", "10000"))
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 # --------------------------
-# Main
+# Main (Worker entrypoint)
 # --------------------------
 def main():
     if not (DEEPSEEK_API_KEY and BINANCE_API_KEY and BINANCE_API_SECRET):
@@ -940,10 +914,12 @@ def main():
         return
 
     db_init()
-    print_resources_summary()
 
+    # Worker MUST NOT run the panel on Render; set ANALYTICS_ENABLED=false in worker service.
     if ANALYTICS_ENABLED:
-        start_panel()
+        # Local dev only: start panel in a side thread
+        t = Thread(target=start_panel, daemon=True)
+        t.start()
 
     b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
     d = DeepSeek(DEEPSEEK_API_KEY)
