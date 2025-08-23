@@ -1,5 +1,4 @@
 services:
-  # Background worker: runs the trading loop (no web server here)
   - type: worker
     name: trader-worker
     env: python
@@ -11,15 +10,16 @@ services:
         value: "false"
       - key: USE_TESTNET
         value: "true"
-      # Add your secrets in the Render Dashboard (or here if you prefer)
+      # Add these in Render dashboard (Environment):
       # - key: DEEPSEEK_API_KEY
       #   sync: false
       # - key: BINANCE_API_KEY
       #   sync: false
       # - key: BINANCE_API_SECRET
       #   sync: false
+      # - key: DATABASE_URL      # from your Render PostgreSQL
+      #   sync: false
 
-  # Web service: serves the analytics panel at https://<name>.onrender.com
   - type: web
     name: trader-panel
     env: python
@@ -31,10 +31,12 @@ services:
         value: "true"
       - key: USE_TESTNET
         value: "true"
-      # Same note for secrets:
+      # Same secrets here so the panel can read data:
       # - key: DEEPSEEK_API_KEY
       #   sync: false
       # - key: BINANCE_API_KEY
       #   sync: false
       # - key: BINANCE_API_SECRET
+      #   sync: false
+      # - key: DATABASE_URL
       #   sync: false
