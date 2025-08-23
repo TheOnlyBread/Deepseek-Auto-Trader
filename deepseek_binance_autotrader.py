@@ -8,7 +8,6 @@ import hmac
 import hashlib
 import json
 import math
-import threading
 from threading import Thread, Lock
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -49,12 +48,14 @@ USE_HYBRID_GATES = os.getenv("USE_HYBRID_GATES", "true").lower() == "true"
 SIZE_SCALE_MIN = float(os.getenv("SIZE_SCALE_MIN", "0.35"))
 SIZE_SCALE_MAX = float(os.getenv("SIZE_SCALE_MAX", "1.25"))
 
-# Analytics panel (Worker should set ANALYTICS_ENABLED=false on Render)
+# Analytics panel
 ANALYTICS_ENABLED = os.getenv("ANALYTICS_ENABLED", "false").lower() == "true"
 ANALYTICS_HOST = os.getenv("ANALYTICS_HOST", "0.0.0.0")
 ANALYTICS_PORT = int(os.getenv("ANALYTICS_PORT", "10000"))
+# NEW: let panel decide to call Binance or not (default false on Render)
+PANEL_CALLS_BINANCE = os.getenv("PANEL_CALLS_BINANCE", "false").lower() == "true"
 
-# ROI model (assumptions you control)
+# ROI model
 EQUITY_USDT = float(os.getenv("EQUITY_USDT", "1000"))
 ROI_TRADES_PER_DAY = float(os.getenv("ROI_TRADES_PER_DAY", "20"))
 ROI_WIN_RATE = float(os.getenv("ROI_WIN_RATE", "0.54"))
@@ -86,7 +87,6 @@ def _ts_ms() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
 def _hmac_sha256(secret: str, msg: str) -> str:
-    import hashlib, hmac
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
 def as_float(x, default=np.nan):
@@ -123,7 +123,7 @@ def pct_rank(x: np.ndarray, v: float) -> float:
     return float((x <= v).sum()) / float(len(x))
 
 # --------------------------
-# Database adapter (SQLite for local, Postgres on Render if DATABASE_URL set)
+# Database adapter (SQLite local, Postgres on Render if DATABASE_URL set)
 # --------------------------
 import sqlite3
 import contextlib
@@ -160,22 +160,26 @@ def db_init():
                 llm_signal TEXT, confidence DOUBLE PRECISION,
                 gated_signal TEXT, sl_pct DOUBLE PRECISION, tp_pct DOUBLE PRECISION,
                 regime_json TEXT
-            );
-            """)
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS trades(
                 id SERIAL PRIMARY KEY,
                 ts_open DOUBLE PRECISION, symbol TEXT, side TEXT, qty DOUBLE PRECISION,
                 entry_price DOUBLE PRECISION, sl_price DOUBLE PRECISION, tp_price DOUBLE PRECISION,
                 ts_close DOUBLE PRECISION, close_price DOUBLE PRECISION, realized_pnl DOUBLE PRECISION, exit_reason TEXT
-            );
-            """)
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS regime(
                 id SERIAL PRIMARY KEY,
                 ts DOUBLE PRECISION, features_json TEXT, info_json TEXT
-            );
-            """)
+            );""")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS account_cache(
+                id SERIAL PRIMARY KEY,
+                ts DOUBLE PRECISION,
+                balance_usdt DOUBLE PRECISION,
+                pnl24h DOUBLE PRECISION
+            );""")
         else:
             cur.execute("""
             CREATE TABLE IF NOT EXISTS decisions(
@@ -184,22 +188,26 @@ def db_init():
                 llm_signal TEXT, confidence REAL,
                 gated_signal TEXT, sl_pct REAL, tp_pct REAL,
                 regime_json TEXT
-            );
-            """)
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS trades(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts_open REAL, symbol TEXT, side TEXT, qty REAL,
                 entry_price REAL, sl_price REAL, tp_price REAL,
                 ts_close REAL, close_price REAL, realized_pnl REAL, exit_reason TEXT
-            );
-            """)
+            );""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS regime(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL, features_json TEXT, info_json TEXT
-            );
-            """)
+            );""")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS account_cache(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL,
+                balance_usdt REAL,
+                pnl24h REAL
+            );""")
             conn.commit()
 
 def db_insert(table: str, row: dict):
@@ -232,15 +240,13 @@ def db_update_trade_close(trade_id: int, ts_close: float, close_price: float, re
             conn.commit()
 
 def db_select_rows(sql_sqlite: str, sql_pg: str, params: tuple = ()):
-    """Run a SELECT that differs only in placeholders between sqlite ('?') and postgres ('%s')."""
     with db_conn() as conn:
         cur = conn.cursor()
         if USE_PG:
             cur.execute(sql_pg, params)
         else:
             cur.execute(sql_sqlite, params)
-        rows = cur.fetchall()
-    return rows
+        return cur.fetchall()
 
 # --------------------------
 # Binance Futures client
@@ -341,7 +347,7 @@ class BinanceFutures:
         p = {}
         if startTime: p["startTime"] = startTime
         if endTime: p["endTime"] = endTime
-        if incomeType: p["incomeType"] = incomeType  # e.g., "REALIZED_PNL"
+        if incomeType: p["incomeType"] = incomeType  # "REALIZED_PNL"
         return self._request("GET", "/fapi/v1/income", p, signed=True)
 
     def balances(self):
@@ -437,11 +443,8 @@ class DeepSeek:
 def build_features(klines: list) -> Tuple[pd.DataFrame, Dict[str, float]]:
     cols = ["t", "o", "h", "l", "c", "v", "ct", "qv", "n", "tbv", "tqv", "i"]
     df = pd.DataFrame(klines, columns=cols[:len(klines[0])])
-    df["o"] = df["o"].astype(float)
-    df["h"] = df["h"].astype(float)
-    df["l"] = df["l"].astype(float)
-    df["c"] = df["c"].astype(float)
-    df["v"] = df["v"].astype(float)
+    for col in ("o", "h", "l", "c", "v"):
+        df[col] = df[col].astype(float)
     df["ret1"] = df["c"].pct_change().fillna(0)
     df["hl_range"] = (df["h"] - df["l"]) / df["o"].replace(0, np.nan)
     df["ema_fast"] = ema(df["c"], 9)
@@ -539,7 +542,7 @@ class RegimeAnalyzer:
         btc_trend_raw = (btc_ema50 - btc_ema200) / btc_close
         btc_trend_state = np.sign(btc_trend_raw.iloc[-1])
 
-        win = int((24 * 30))  # 30 days of 1h
+        win = int(24 * 30)  # 30 days of 1h
         btc_vol = joined["btc_r"].rolling(win).std()
         vol_latest = float(btc_vol.iloc[-1])
         vol_hist = btc_vol.values
@@ -582,6 +585,54 @@ class RegimeAnalyzer:
             "window_corr_hours": int(w7)
         }
         return RegimeSnapshot(ts=time.time(), features=feat, info=info)
+
+# --------------------------
+# Account cache writer (worker → DB; panel reads it)
+# --------------------------
+class AccountCacheWriter:
+    def __init__(self, bclient: BinanceFutures, interval_sec: int = 300):
+        self.b = bclient
+        self.interval = max(60, interval_sec)
+        self._stop = False
+        self.th = Thread(target=self._loop, daemon=True)
+        self.th.start()
+
+    def stop(self):
+        self._stop = True
+
+    def _loop(self):
+        while not self._stop:
+            try:
+                bal = None
+                pnl = None
+                try:
+                    # balance
+                    res = self.b.balances()
+                    usdt = [x for x in res if x.get("asset") == "USDT"]
+                    if usdt:
+                        bal = float(usdt[0].get("balance", 0.0))
+                except Exception as e:
+                    print(f"[AcctCache] balance err: {e}")
+
+                try:
+                    # 24h realized pnl
+                    since = int((datetime.now(tz=timezone.utc) - timedelta(days=1)).timestamp() * 1000)
+                    inc = self.b.income_history(startTime=since, incomeType="REALIZED_PNL")
+                    total = 0.0
+                    for x in inc:
+                        total += float(x.get("income", 0.0))
+                    pnl = total
+                except Exception as e:
+                    print(f"[AcctCache] pnl24h err: {e}")
+
+                db_insert("account_cache", {
+                    "ts": time.time(),
+                    "balance_usdt": bal if bal is not None else None,
+                    "pnl24h": pnl if pnl is not None else None
+                })
+            except Exception as e:
+                print(f"[AcctCache] loop err: {e}")
+            time.sleep(self.interval)
 
 # --------------------------
 # Trading logic
@@ -774,8 +825,6 @@ class AutoTrader:
         print(f"[Bot] Testnet={USE_TESTNET} | Symbol={self.symbol} | Lev={LEVERAGE} | Notional={NOTIONAL_PER_TRADE_USDT} USDT")
         print(f"[Regime] Lookback={REGIME_LOOKBACK_DAYS}d @ {REGIME_INTERVAL} | Refresh={REGIME_REFRESH_MINUTES}m | Gates={USE_HYBRID_GATES}")
         print("[Bot] Running. Ctrl+C to stop.")
-        b2 = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
-        self.d = DeepSeek(DEEPSEEK_API_KEY)
         while True:
             try:
                 self.step()
@@ -787,10 +836,6 @@ class AutoTrader:
                 print(f"[HTTP] {e}")
             except KeyboardInterrupt:
                 print("Bye.")
-                try:
-                    self.regime.stop()
-                except Exception:
-                    pass
                 break
             except Exception as e:
                 print(f"[Error] {type(e).__name__}: {e}")
@@ -849,8 +894,8 @@ async function load(){
      <div><span class="badge">Testnet</span> ${s.testnet}</div>
      <div><span class="badge">Leverage</span> ${s.leverage}</div>
      <div><span class="badge">Notional</span> ${s.notional} USDT</div>
-     <div><span class="badge">Balance (USDT)</span> ${s.balance_usdt}</div>
-     <div><span class="badge">24h Realized PnL</span> ${s.pnl24h}</div>`;
+     <div><span class="badge">Balance (USDT)</span> ${s.balance_usdt ?? '—'}</div>
+     <div><span class="badge">24h Realized PnL</span> ${s.pnl24h ?? '—'}</div>`;
   document.getElementById('roi').innerHTML =
     `<div><b>Exp. Daily PnL</b>: ${r.expected_daily_pnl_usdt.toFixed(2)} USDT</div>
      <div>Trades/Day: ${r.trades_per_day}, Win%: ${(r.win_rate*100).toFixed(0)}%, AvgWinR: ${r.avg_win_r}, AvgLossR: ${r.avg_loss_r}, Risk/Trade: ${r.risk_per_trade}</div>
@@ -876,7 +921,18 @@ setInterval(load, 4000); load();
 </body></html>
     """
 
-    def _balances():
+    def _balances_pnl_from_cache():
+        rows = db_select_rows(
+            "SELECT balance_usdt,pnl24h FROM account_cache ORDER BY id DESC LIMIT 1;",
+            "SELECT balance_usdt,pnl24h FROM account_cache ORDER BY id DESC LIMIT 1;",
+            ()
+        )
+        if rows:
+            b, p = rows[0]
+            return (None if b is None else float(b)), (None if p is None else float(p))
+        return (None, None)
+
+    def _balances_live():
         try:
             b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
             res = b.balances()
@@ -884,10 +940,10 @@ setInterval(load, 4000); load();
             if usdt:
                 return float(usdt[0].get("balance", 0.0))
         except Exception as e:
-            print(f"[Panel] balances: {e}")
+            print(f"[Panel] balances live err: {e}")
         return None
 
-    def _pnl24h():
+    def _pnl24h_live():
         try:
             b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
             since = int((datetime.now(tz=timezone.utc) - timedelta(days=1)).timestamp() * 1000)
@@ -897,7 +953,7 @@ setInterval(load, 4000); load();
                 total += float(x.get("income", 0.0))
             return total
         except Exception as e:
-            print(f"[Panel] pnl24h: {e}")
+            print(f"[Panel] pnl24h live err: {e}")
             return None
 
     def _roi_model():
@@ -937,10 +993,10 @@ setInterval(load, 4000); load();
                 (limit,)
             )
             rows = [{"ts": r[0], "price": r[1], "llm_signal": r[2], "confidence": r[3], "gated_signal": r[4]} for r in rows]
-            return JSONResponse({"rows": rows})
+            return {"rows": rows}
         except Exception as e:
             print(f"[Panel] decisions query: {e}")
-            return JSONResponse({"rows": []})
+            return {"rows": []}
 
     @app.get("/api/regime")
     def api_regime():
@@ -951,22 +1007,27 @@ setInterval(load, 4000); load();
                 ()
             )
             if not rows:
-                return JSONResponse({})
+                return {}
             row = rows[0]
-            return JSONResponse({"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])})
+            return {"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])}
         except Exception as e:
             print(f"[Panel] regime query: {e}")
-            return JSONResponse({})
+            return {}
 
     @app.get("/api/status")
     def api_status():
+        # Prefer cache written by worker; optionally use live if PANEL_CALLS_BINANCE=true
+        bal, pnl = _balances_pnl_from_cache()
+        if PANEL_CALLS_BINANCE and (bal is None or pnl is None):
+            bal = _balances_live() if bal is None else bal
+            pnl = _pnl24h_live() if pnl is None else pnl
         return {
             "symbol": SYMBOL,
             "testnet": USE_TESTNET,
             "leverage": LEVERAGE,
             "notional": NOTIONAL_PER_TRADE_USDT,
-            "balance_usdt": _balances(),
-            "pnl24h": _pnl24h(),
+            "balance_usdt": bal,
+            "pnl24h": pnl,
         }
 
     @app.get("/api/roi")
@@ -994,7 +1055,7 @@ def main():
         print("Missing keys (DEEPSEEK_API_KEY, BINANCE_API_KEY, BINANCE_API_SECRET).")
         return
 
-    db_init()  # ensure tables for the worker
+    db_init()  # ensure tables
 
     if ANALYTICS_ENABLED:
         # local dev only
@@ -1002,6 +1063,10 @@ def main():
 
     b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
     d = DeepSeek(DEEPSEEK_API_KEY)
+
+    # start account cache writer (panel will read this)
+    AccountCacheWriter(b, interval_sec=300)
+
     AutoTrader(b, d, SYMBOL).loop()
 
 if __name__ == "__main__":
