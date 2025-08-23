@@ -52,7 +52,6 @@ SIZE_SCALE_MAX = float(os.getenv("SIZE_SCALE_MAX", "1.25"))
 ANALYTICS_ENABLED = os.getenv("ANALYTICS_ENABLED", "false").lower() == "true"
 ANALYTICS_HOST = os.getenv("ANALYTICS_HOST", "0.0.0.0")
 ANALYTICS_PORT = int(os.getenv("ANALYTICS_PORT", "10000"))
-# NEW: let panel decide to call Binance or not (default false on Render)
 PANEL_CALLS_BINANCE = os.getenv("PANEL_CALLS_BINANCE", "false").lower() == "true"
 
 # ROI model
@@ -606,7 +605,6 @@ class AccountCacheWriter:
                 bal = None
                 pnl = None
                 try:
-                    # balance
                     res = self.b.balances()
                     usdt = [x for x in res if x.get("asset") == "USDT"]
                     if usdt:
@@ -615,7 +613,6 @@ class AccountCacheWriter:
                     print(f"[AcctCache] balance err: {e}")
 
                 try:
-                    # 24h realized pnl
                     since = int((datetime.now(tz=timezone.utc) - timedelta(days=1)).timestamp() * 1000)
                     inc = self.b.income_history(startTime=since, incomeType="REALIZED_PNL")
                     total = 0.0
@@ -648,7 +645,7 @@ class AutoTrader:
 
         self.active_trade_id: Optional[int] = None
         self.active_entry_price: Optional[float] = None
-        self.active_side: Optional[str] = None
+               self.active_side: Optional[str] = None
         self.active_qty: Optional[float] = None
 
         self.regime = RegimeAnalyzer(self.b)
@@ -845,7 +842,7 @@ class AutoTrader:
 # Analytics Panel (ASGI app builder + optional local runner)
 # --------------------------
 def build_panel_app():
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Response
     from fastapi.responses import HTMLResponse, JSONResponse
 
     # Ensure tables exist (web and worker are separate containers)
@@ -921,6 +918,52 @@ setInterval(load, 4000); load();
 </body></html>
     """
 
+    app.DASH = DASH
+
+    @app.get("/", response_class=HTMLResponse)
+    def home():
+        return HTMLResponse(DASH)
+
+    # ✅ Explicit HEAD / to satisfy Render's health pings that use HEAD
+    @app.head("/")
+    def head_home():
+        return Response(status_code=200)
+
+    # ✅ Dedicated health endpoint for health checks
+    @app.get("/healthz")
+    def healthz():
+        return {"ok": True}
+
+    @app.get("/api/decisions")
+    def api_decisions(limit: int = 50):
+        try:
+            rows = db_select_rows(
+                "SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT ?;",
+                "SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT %s;",
+                (limit,)
+            )
+            rows = [{"ts": r[0], "price": r[1], "llm_signal": r[2], "confidence": r[3], "gated_signal": r[4]} for r in rows]
+            return {"rows": rows}
+        except Exception as e:
+            print(f"[Panel] decisions query: {e}")
+            return {"rows": []}
+
+    @app.get("/api/regime")
+    def api_regime():
+        try:
+            rows = db_select_rows(
+                "SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;",
+                "SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;",
+                ()
+            )
+            if not rows:
+                return {}
+            row = rows[0]
+            return {"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])}
+        except Exception as e:
+            print(f"[Panel] regime query: {e}")
+            return {}
+
     def _balances_pnl_from_cache():
         rows = db_select_rows(
             "SELECT balance_usdt,pnl24h FROM account_cache ORDER BY id DESC LIMIT 1;",
@@ -978,45 +1021,8 @@ setInterval(load, 4000); load();
         cpu_needs = "1 vCPU / 512MB is fine; use 2 vCPU / 1–2GB for more symbols or 10–15s loop."
         return {"year_bars": year_bars, "mem_mb": mem_mb, "cpu_needs": cpu_needs}
 
-    app.DASH = DASH
-
-    @app.get("/", response_class=HTMLResponse)
-    def home():
-        return HTMLResponse(DASH)
-
-    @app.get("/api/decisions")
-    def api_decisions(limit: int = 50):
-        try:
-            rows = db_select_rows(
-                "SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT ?;",
-                "SELECT ts,price,llm_signal,confidence,gated_signal FROM decisions ORDER BY id DESC LIMIT %s;",
-                (limit,)
-            )
-            rows = [{"ts": r[0], "price": r[1], "llm_signal": r[2], "confidence": r[3], "gated_signal": r[4]} for r in rows]
-            return {"rows": rows}
-        except Exception as e:
-            print(f"[Panel] decisions query: {e}")
-            return {"rows": []}
-
-    @app.get("/api/regime")
-    def api_regime():
-        try:
-            rows = db_select_rows(
-                "SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;",
-                "SELECT ts,features_json,info_json FROM regime ORDER BY id DESC LIMIT 1;",
-                ()
-            )
-            if not rows:
-                return {}
-            row = rows[0]
-            return {"ts": row[0], "features": json.loads(row[1]), "info": json.loads(row[2])}
-        except Exception as e:
-            print(f"[Panel] regime query: {e}")
-            return {}
-
     @app.get("/api/status")
     def api_status():
-        # Prefer cache written by worker; optionally use live if PANEL_CALLS_BINANCE=true
         bal, pnl = _balances_pnl_from_cache()
         if PANEL_CALLS_BINANCE and (bal is None or pnl is None):
             bal = _balances_live() if bal is None else bal
