@@ -1,8 +1,9 @@
 # deepseek_binance_autotrader.py
-# Single-process FastAPI panel + futures testnet bot (no DB). Ready for Render.com.
-# Fixes:
-#  - Sign ALL signed endpoints (GET/POST/DELETE) with HMAC, fixing HTTP 400 -1102.
-#  - RegimeAnalyzer handles 12-col klines correctly.
+# Render-ready FastAPI panel + Binance USDⓈ-M Futures *testnet* bot (no DB).
+# Fixes (critical):
+#   - Sign EXACT query string actually sent (no dict reordering).
+#   - Sync server time; apply time offset to all signed endpoints.
+#   - Keep previous regime + panel + trading logic.
 
 import os
 import time
@@ -13,15 +14,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Tuple, Optional, List
 from collections import deque
+from urllib.parse import urlencode
 
 import requests
 import numpy as np
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# -------------------------------------------------------------------
-# ENV
-# -------------------------------------------------------------------
+# -------------------- ENV --------------------
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -55,9 +55,7 @@ DEEPSEEK_BASE = "https://api.deepseek.com"
 DEEPSEEK_CHAT_PATH = "/chat/completions"
 BINANCE_FAPI_BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 
-# -------------------------------------------------------------------
-# In-memory state
-# -------------------------------------------------------------------
+# -------------------- In-memory state --------------------
 DECISIONS = deque(maxlen=5000)
 REGIME_SNAPSHOT: Dict[str, Any] = {}
 ACCOUNT = {"balance_usdt": None, "pnl24h": None}
@@ -109,9 +107,7 @@ def get_account() -> dict:
     with LOCK:
         return dict(ACCOUNT)
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
+# -------------------- Helpers --------------------
 class BinanceHTTPError(Exception):
     def __init__(self, status: int, body: str, where: str):
         super().__init__(f"{where} | HTTP {status} | {body}")
@@ -154,9 +150,7 @@ def pct_rank(x: np.ndarray, v: float) -> float:
     if len(x) == 0: return 0.5
     return float((x <= v).sum()) / float(len(x))
 
-# -------------------------------------------------------------------
-# Binance client (USDⓈ-M Futures)
-# -------------------------------------------------------------------
+# -------------------- Binance client (signed GET/POST/DELETE + time sync) --------------------
 class BinanceFutures:
     def __init__(self, api_key: str, api_secret: str, base_url: str):
         self.ak = api_key
@@ -164,34 +158,73 @@ class BinanceFutures:
         self.base = base_url
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": self.ak})
+        self.time_offset_ms = 0
+        try:
+            self._sync_time()
+        except Exception as e:
+            # If time sync fails at boot, we will retry lazily on first signed call.
+            print(f"[TimeSync] warn: {e}")
+
+    def _sync_time(self):
+        url = self.base + "/fapi/v1/time"
+        r = self.session.get(url, timeout=10)
+        r.raise_for_status()
+        server_time = int(r.json()["serverTime"])
+        local = _ts_ms()
+        self.time_offset_ms = server_time - local
+        print(f"[TimeSync] offset_ms={self.time_offset_ms}")
+
+    def _signed_qs(self, params: Dict[str, Any]) -> str:
+        """
+        Build EXACT query string and signature.
+        We:
+          - add timestamp (with offset) and recvWindow,
+          - build a list of (key,value) tuples in the exact order we want,
+          - urlencode that string,
+          - sign that exact string,
+          - return final "qs&signature=..." string.
+        """
+        base_params = dict(params or {})
+        # Ensure time is synced; if offset huge, resync
+        if abs(self.time_offset_ms) > 60_000:
+            try: self._sync_time()
+            except Exception as e: print(f"[TimeSync] retry failed: {e}")
+        base_params["timestamp"] = _ts_ms() + self.time_offset_ms
+        base_params.setdefault("recvWindow", 5000)
+
+        # Preserve deterministic order: sort by key to avoid local dict randomness
+        # (We sign this order AND send in this order)
+        items = sorted(base_params.items(), key=lambda kv: kv[0])
+        qs = urlencode(items, doseq=True)
+        sig = _hmac_sha256(self.sk, qs)
+        return f"{qs}&signature={sig}"
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.25, min=0.25, max=1.8),
            retry=retry_if_exception_type(BinanceHTTPError))
     def _request(self, method: str, path: str, params: Dict[str, Any] = None, signed: bool = False):
-        """
-        Unified signer for GET/POST/DELETE. All signed endpoints receive timestamp, recvWindow, signature.
-        """
         url = self.base + path
-        params = dict(params or {})
         where = f"{method} {path}"
 
-        if signed:
-            params["timestamp"] = _ts_ms()
-            params.setdefault("recvWindow", 5000)
-            # Build canonical query string in key order and sign it
-            q = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
-            params["signature"] = _hmac_sha256(self.sk, q)
-
         try:
-            if method == "GET":
-                resp = self.session.get(url, params=params, timeout=20)
-            elif method == "POST":
-                # Binance expects signed params in the query string (params), not JSON body.
-                resp = self.session.post(url, params=params, timeout=20)
-            elif method == "DELETE":
-                resp = self.session.delete(url, params=params, timeout=20)
+            if signed:
+                final_qs = self._signed_qs(params or {})
+                if method == "GET" or method == "DELETE":
+                    full = f"{url}?{final_qs}"
+                    resp = self.session.request(method, full, timeout=20)
+                elif method == "POST":
+                    # Binance accepts application/x-www-form-urlencoded body OR query string.
+                    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+                    resp = self.session.post(url, data=final_qs, headers=headers, timeout=20)
+                else:
+                    raise ValueError("Unsupported method")
             else:
-                raise ValueError("Unsupported method")
+                # Public, no signature
+                if method == "GET" or method == "DELETE":
+                    resp = self.session.request(method, url, params=params, timeout=20)
+                elif method == "POST":
+                    resp = self.session.post(url, params=params, timeout=20)
+                else:
+                    raise ValueError("Unsupported method")
         except requests.RequestException as e:
             set_last_error(f"{where} | RequestException: {e}")
             raise BinanceHTTPError(599, f"network error: {e}", where)
@@ -199,6 +232,10 @@ class BinanceFutures:
         if resp.status_code >= 400:
             body = resp.text[:500]
             set_last_error(f"{where} | HTTP {resp.status_code} | {body}")
+            # Try one quick time resync if invalid timestamp
+            if resp.status_code == 400 and ("-1021" in body or "Timestamp" in body):
+                try: self._sync_time()
+                except Exception: pass
             raise BinanceHTTPError(resp.status_code, body, where)
         return resp.json()
 
@@ -255,9 +292,7 @@ class BinanceFutures:
     def balances(self):
         return self._request("GET", "/fapi/v2/balance", signed=True)
 
-# -------------------------------------------------------------------
-# Indicators / quantization
-# -------------------------------------------------------------------
+# -------------------- Indicators / quantization --------------------
 @dataclass
 class SymbolFilters:
     step_size: float
@@ -284,9 +319,7 @@ def quantize_price(px: float, tick: float) -> float:
     ticks = math.floor(px / tick)
     return round(ticks * tick, 12)
 
-# -------------------------------------------------------------------
-# DeepSeek (strict JSON)
-# -------------------------------------------------------------------
+# -------------------- DeepSeek (strict JSON) --------------------
 class DeepSeek:
     def __init__(self, api_key: str):
         self.ak = api_key
@@ -314,9 +347,7 @@ class DeepSeek:
         if sig not in ("long", "short", "flat"): sig = "flat"
         return {"signal": sig, "confidence": conf, "sl_pct": abs(slp), "tp_pct": abs(tpp)}
 
-# -------------------------------------------------------------------
-# Feature builders
-# -------------------------------------------------------------------
+# -------------------- Feature builders --------------------
 def build_features(klines: list):
     # 12-column kline format
     cols12 = ["ot","o","h","l","c","v","ct","qv","n","tbv","tqv","x"]
@@ -337,9 +368,7 @@ def build_features(klines: list):
         if not np.isfinite(v): feat[k] = 0.0
     return df, feat
 
-# -------------------------------------------------------------------
-# Regime analyzer
-# -------------------------------------------------------------------
+# -------------------- Regime analyzer --------------------
 @dataclass
 class RegimeSnapshot:
     ts: float
@@ -371,11 +400,12 @@ class RegimeAnalyzer:
         for c in ("o","h","l","c","v"): df[c] = df[c].astype(float)
         df["dt"] = pd.to_datetime(df["ct"], unit="ms", utc=True)
         df.set_index("dt", inplace=True)
-        return df[["o","h","l","c","v","ct"]]
+        return df[{"o","h","l","c","v","ct"}]
 
     def _compute_once(self) -> RegimeSnapshot:
         btc = self._fetch_year("BTCUSDT", REGIME_INTERVAL)
         alt = self._fetch_year(ACTIVE_SYMBOL, REGIME_INTERVAL)
+        btc = btc.sort_index(); alt = alt.sort_index()
         joined = btc[["c"]].rename(columns={"c":"btc_c"}).join(
             alt[["c"]].rename(columns={"c":"alt_c"}), how="inner").dropna()
         joined["btc_r"] = joined["btc_c"].pct_change()
@@ -438,9 +468,7 @@ class RegimeAnalyzer:
                 print(f"[Regime] error: {e}")
             time.sleep(REGIME_REFRESH_MINUTES * 60)
 
-# -------------------------------------------------------------------
-# Trading
-# -------------------------------------------------------------------
+# -------------------- Trading --------------------
 def quantize_qty_for_notional(price: float, notional: float, step: float, min_qty: float) -> float:
     raw = notional / price
     return quantize_qty(raw, step, min_qty)
@@ -588,9 +616,7 @@ class AutoTrader:
                 print(f"[Error] {type(e).__name__}: {e}")
             time.sleep(DECISION_COOLDOWN_SEC)
 
-# -------------------------------------------------------------------
-# Account cache writer
-# -------------------------------------------------------------------
+# -------------------- Account cache writer --------------------
 class AccountCacheWriter:
     def __init__(self, bclient: BinanceFutures, interval_sec: int = 300):
         self.b = bclient; self.interval = max(60, interval_sec)
@@ -614,9 +640,7 @@ class AccountCacheWriter:
             put_account(bal, pnl)
             time.sleep(self.interval)
 
-# -------------------------------------------------------------------
-# FastAPI panel
-# -------------------------------------------------------------------
+# -------------------- FastAPI Panel --------------------
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 
@@ -748,10 +772,8 @@ setInterval(load, 4000); load();
 
     return app
 
-# -------------------------------------------------------------------
-# Startup wiring
-# -------------------------------------------------------------------
-ACTIVE_SYMBOL = SYMBOL  # may be changed at startup if symbol not found
+# -------------------- Startup wiring --------------------
+ACTIVE_SYMBOL = SYMBOL
 
 def start_everything():
     global ACTIVE_SYMBOL
@@ -766,7 +788,7 @@ def start_everything():
 
     b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
 
-    # Check if the requested SYMBOL exists on this environment
+    # Check if symbol exists on the chosen env
     try:
         ex = b.exchange_info(SYMBOL)
         if not ex:
