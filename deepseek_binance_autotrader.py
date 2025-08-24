@@ -1,10 +1,9 @@
 # deepseek_binance_autotrader.py
 # Render-ready FastAPI panel + Binance USDⓈ-M Futures *testnet* bot (no DB).
-# Fixes:
-#   - Sign EXACT query string actually sent (no dict reordering).
-#   - Sync server time; apply time offset to all signed endpoints.
-#   - Regime bug: use list indexer for columns (NOT set) to satisfy pandas.
-#   - Keep regime + panel + trading logic intact.
+# Updates:
+#   - DeepSeek HTTP/401/429/etc => safe "flat" signal + /api/last_error message (no crash).
+#   - Unwrap tenacity.RetryError to show root cause.
+#   - Keeps previous fixes: proper signature, time sync, pandas list indexer, no DB, panel.
 
 import os
 import time
@@ -20,7 +19,7 @@ from urllib.parse import urlencode
 import requests
 import numpy as np
 import pandas as pd
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError as TenacityRetryError
 
 # -------------------- ENV --------------------
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -76,7 +75,7 @@ def get_notice() -> str:
 def set_last_error(msg: str):
     global LAST_ERROR
     with LOCK:
-        LAST_ERROR = msg
+        LAST_ERROR = msg[:2000]  # cap
 
 def get_last_error() -> str:
     with LOCK:
@@ -151,7 +150,7 @@ def pct_rank(x: np.ndarray, v: float) -> float:
     if len(x) == 0: return 0.5
     return float((x <= v).sum()) / float(len(x))
 
-# -------------------- Binance client (signed GET/POST/DELETE + time sync) --------------------
+# -------------------- Binance client --------------------
 class BinanceFutures:
     def __init__(self, api_key: str, api_secret: str, base_url: str):
         self.ak = api_key
@@ -302,7 +301,7 @@ def quantize_price(px: float, tick: float) -> float:
     ticks = math.floor(px / tick)
     return round(ticks * tick, 12)
 
-# -------------------- DeepSeek (strict JSON) --------------------
+# -------------------- DeepSeek (safe JSON; tolerant to HTTP errors) --------------------
 class DeepSeek:
     def __init__(self, api_key: str):
         self.ak = api_key
@@ -319,10 +318,20 @@ class DeepSeek:
             "messages": [{"role": "system", "content": sys}, {"role": "user", "content": usr}],
             "temperature": 0.15, "max_tokens": 150, "response_format": {"type": "json_object"},
         }
-        r = self.session.post(DEEPSEEK_BASE + DEEPSEEK_CHAT_PATH, data=json.dumps(payload), timeout=20)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
+        try:
+            r = self.session.post(DEEPSEEK_BASE + DEEPSEEK_CHAT_PATH, data=json.dumps(payload), timeout=20)
+            if r.status_code >= 400:
+                # Write exact status + trimmed body; return flat to avoid crashing loop.
+                body = r.text[:300]
+                set_last_error(f"DeepSeek decide HTTP {r.status_code} | {body}")
+                # Return a safe no-trade signal
+                return {"signal": "flat", "confidence": 0.0, "sl_pct": 0.01, "tp_pct": 0.02}
+            content = r.json()["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+        except (requests.RequestException, ValueError, KeyError) as e:
+            set_last_error(f"DeepSeek decide exception: {e}")
+            return {"signal": "flat", "confidence": 0.0, "sl_pct": 0.01, "tp_pct": 0.02}
+
         sig = parsed.get("signal", "flat")
         conf = float(parsed.get("confidence", 0.0))
         slp = float(parsed.get("sl_pct", 0.01))
@@ -332,7 +341,6 @@ class DeepSeek:
 
 # -------------------- Feature builders --------------------
 def build_features(klines: list):
-    # 12-column kline format
     cols12 = ["ot","o","h","l","c","v","ct","qv","n","tbv","tqv","x"]
     df = pd.DataFrame(klines, columns=cols12)
     for col in ("o","h","l","c","v"): df[col] = df[col].astype(float)
@@ -383,7 +391,7 @@ class RegimeAnalyzer:
         for c in ("o","h","l","c","v"): df[c] = df[c].astype(float)
         df["dt"] = pd.to_datetime(df["ct"], unit="ms", utc=True)
         df.set_index("dt", inplace=True)
-        # IMPORTANT: use a LIST here (NOT a set) to satisfy pandas indexer.
+        # LIST (not set) for pandas indexer:
         return df[["o","h","l","c","v","ct"]]
 
     def _compute_once(self) -> RegimeSnapshot:
@@ -559,12 +567,7 @@ class AutoTrader:
         all_feat = {**feat}
         for k, v in snap.features.items(): all_feat[f"X_{k}"] = float(v)
 
-        try:
-            decision = DeepSeek(DEEPSEEK_API_KEY).decide(all_feat)
-        except Exception as e:
-            set_last_error(f"DeepSeek decide error: {e}")
-            raise
-
+        decision = DeepSeek(DEEPSEEK_API_KEY).decide(all_feat)
         sig, conf = decision["signal"], decision["confidence"]
         slp = max(0.001, decision["sl_pct"]); tpp = max(0.001, decision["tp_pct"])
         gated_sig = self._hybrid_gate(sig, snap.features)
@@ -592,6 +595,10 @@ class AutoTrader:
             except BinanceHTTPError as e:
                 set_last_error(str(e))
                 print(f"[Binance] {e}")
+            except TenacityRetryError as e:
+                root = repr(getattr(e.last_attempt, "exception", lambda: None)())
+                set_last_error(f"RetryError root cause: {root}")
+                print(f"[RetryError] {root}")
             except requests.RequestException as e:
                 set_last_error(f"Requests error: {e}")
                 print(f"[HTTP] {e}")
