@@ -1,8 +1,11 @@
-# app.py — single-service FastAPI + trader loop (no DB, all in-memory)
-# Changes:
-#  - Startup symbol check with fallback to BTCUSDT if SYMBOL not on this environment (e.g., testnet).
-#  - Clearer error messages surfaced via /api/last_error and panel status.
-#  - More verbose logging for BinanceHTTPError.
+# deepseek_binance_autotrader.py
+# Single-process FastAPI panel + futures testnet bot (no DB). Ready for Render.com.
+# Fixes:
+#  - RegimeAnalyzer._fetch_year(): handles 12-column klines correctly.
+#  - Clearer surface of BinanceHTTPError via /api/last_error in panel.
+# Notes:
+#  - Uses USDⓈ-M Futures testnet when USE_TESTNET=true.
+#  - Keeps all state in memory; no DB required.
 
 import os
 import time
@@ -19,14 +22,14 @@ import numpy as np
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# --------------------------
+# -------------------------------------------------------------------
 # ENV
-# --------------------------
+# -------------------------------------------------------------------
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
-SYMBOL = os.getenv("SYMBOL", "1000PEPEUSDT")
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 INTERVAL = os.getenv("INTERVAL", "1m")
 KLIMIT = int(os.getenv("KLIMIT", "250"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
@@ -55,14 +58,14 @@ DEEPSEEK_BASE = "https://api.deepseek.com"
 DEEPSEEK_CHAT_PATH = "/chat/completions"
 BINANCE_FAPI_BASE = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 
-# --------------------------
+# -------------------------------------------------------------------
 # In-memory state
-# --------------------------
+# -------------------------------------------------------------------
 DECISIONS = deque(maxlen=5000)
 REGIME_SNAPSHOT: Dict[str, Any] = {}
 ACCOUNT = {"balance_usdt": None, "pnl24h": None}
-SERVICE_NOTICE = ""  # exposes startup/fallback info to panel
-LAST_ERROR = ""      # exposes last exception info to panel
+SERVICE_NOTICE = ""
+LAST_ERROR = ""
 LOCK = Lock()
 
 def set_notice(msg: str):
@@ -109,9 +112,9 @@ def get_account() -> dict:
     with LOCK:
         return dict(ACCOUNT)
 
-# --------------------------
+# -------------------------------------------------------------------
 # Helpers
-# --------------------------
+# -------------------------------------------------------------------
 class BinanceHTTPError(Exception):
     def __init__(self, status: int, body: str, where: str):
         super().__init__(f"{where} | HTTP {status} | {body}")
@@ -154,9 +157,9 @@ def pct_rank(x: np.ndarray, v: float) -> float:
     if len(x) == 0: return 0.5
     return float((x <= v).sum()) / float(len(x))
 
-# --------------------------
-# Binance client
-# --------------------------
+# -------------------------------------------------------------------
+# Binance client (USDⓈ-M Futures)
+# -------------------------------------------------------------------
 class BinanceFutures:
     def __init__(self, api_key: str, api_secret: str, base_url: str):
         self.ak = api_key
@@ -165,7 +168,7 @@ class BinanceFutures:
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": self.ak})
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.2, min=0.2, max=1.5),
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.25, min=0.25, max=1.8),
            retry=retry_if_exception_type(BinanceHTTPError))
     def _request(self, method: str, path: str, params: Dict[str, Any] = None, signed: bool = False):
         url = self.base + path
@@ -196,11 +199,12 @@ class BinanceFutures:
             raise BinanceHTTPError(599, f"network error: {e}", where)
 
         if resp.status_code >= 400:
-            body = resp.text[:300]
+            body = resp.text[:500]
             set_last_error(f"{where} | HTTP {resp.status_code} | {body}")
             raise BinanceHTTPError(resp.status_code, body, where)
         return resp.json()
 
+    # public
     def klines(self, symbol: str, interval: str, limit: int = 200):
         return self._request("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
@@ -230,6 +234,7 @@ class BinanceFutures:
             return None
         return data
 
+    # signed
     def change_leverage(self, symbol: str, leverage: int):
         return self._request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, signed=True)
 
@@ -252,9 +257,9 @@ class BinanceFutures:
     def balances(self):
         return self._request("GET", "/fapi/v2/balance", signed=True)
 
-# --------------------------
-# Math / indicators
-# --------------------------
+# -------------------------------------------------------------------
+# Indicators / quantization
+# -------------------------------------------------------------------
 @dataclass
 class SymbolFilters:
     step_size: float
@@ -281,9 +286,9 @@ def quantize_price(px: float, tick: float) -> float:
     ticks = math.floor(px / tick)
     return round(ticks * tick, 12)
 
-# --------------------------
+# -------------------------------------------------------------------
 # DeepSeek (strict JSON)
-# --------------------------
+# -------------------------------------------------------------------
 class DeepSeek:
     def __init__(self, api_key: str):
         self.ak = api_key
@@ -311,12 +316,13 @@ class DeepSeek:
         if sig not in ("long", "short", "flat"): sig = "flat"
         return {"signal": sig, "confidence": conf, "sl_pct": abs(slp), "tp_pct": abs(tpp)}
 
-# --------------------------
+# -------------------------------------------------------------------
 # Feature builders
-# --------------------------
+# -------------------------------------------------------------------
 def build_features(klines: list):
-    cols = ["t","o","h","l","c","v","ct","qv","n","tbv","tqv","i"]
-    df = pd.DataFrame(klines, columns=cols[:len(klines[0])])
+    # 12-column kline format
+    cols12 = ["ot","o","h","l","c","v","ct","qv","n","tbv","tqv","x"]
+    df = pd.DataFrame(klines, columns=cols12)
     for col in ("o","h","l","c","v"): df[col] = df[col].astype(float)
     df["ret1"] = df["c"].pct_change().fillna(0)
     df["hl_range"] = (df["h"] - df["l"]) / df["o"].replace(0, np.nan)
@@ -333,9 +339,9 @@ def build_features(klines: list):
         if not np.isfinite(v): feat[k] = 0.0
     return df, feat
 
-# --------------------------
-# Regime analyzer
-# --------------------------
+# -------------------------------------------------------------------
+# Regime analyzer (BTC + active symbol relationships)
+# -------------------------------------------------------------------
 @dataclass
 class RegimeSnapshot:
     ts: float
@@ -357,21 +363,22 @@ class RegimeAnalyzer:
             return self.snapshot
 
     def _fetch_year(self, symbol: str, interval: str) -> pd.DataFrame:
+        """Return OHLCV DataFrame (utc index). Handles 12-col klines."""
         end = datetime.now(tz=timezone.utc)
         start = end - timedelta(days=REGIME_LOOKBACK_DAYS)
         kl = self.b.klines_range(symbol, interval, int(start.timestamp()*1000), int(end.timestamp()*1000), 1500)
-        if not kl or len(kl) < 100: raise LogicSkip(f"Not enough history for {symbol}")
-        cols = ["t","o","h","l","c","v","ct"]
-        df = pd.DataFrame(kl, columns=cols[:len(kl[0])])
+        if not kl or len(kl) < 100:
+            raise LogicSkip(f"Not enough history for {symbol}")
+        cols12 = ["ot","o","h","l","c","v","ct","qv","n","tbv","tqv","x"]
+        df = pd.DataFrame(kl, columns=cols12)
         for c in ("o","h","l","c","v"): df[c] = df[c].astype(float)
         df["dt"] = pd.to_datetime(df["ct"], unit="ms", utc=True)
         df.set_index("dt", inplace=True)
-        return df
+        return df[["o","h","l","c","v","ct"]]
 
     def _compute_once(self) -> RegimeSnapshot:
         btc = self._fetch_year("BTCUSDT", REGIME_INTERVAL)
         alt = self._fetch_year(ACTIVE_SYMBOL, REGIME_INTERVAL)
-
         joined = btc[["c"]].rename(columns={"c":"btc_c"}).join(
             alt[["c"]].rename(columns={"c":"alt_c"}), how="inner").dropna()
         joined["btc_r"] = joined["btc_c"].pct_change()
@@ -416,7 +423,8 @@ class RegimeAnalyzer:
             "alt_rel_strength_7d": float(rel_str),
             "regime_is_chop": float(is_chop),
         }
-        info = {"btc_price": float(btc_close.iloc[-1]), "alt_price": float(joined["alt_c"].iloc[-1]),
+        info = {"btc_price": float(btc_close.iloc[-1]),
+                "alt_price": float(joined['alt_c'].iloc[-1]),
                 "samples_1h": int(len(joined)), "window_corr_hours": int(w7)}
         return RegimeSnapshot(ts=time.time(), features=feat, info=info)
 
@@ -433,9 +441,9 @@ class RegimeAnalyzer:
                 print(f"[Regime] error: {e}")
             time.sleep(REGIME_REFRESH_MINUTES * 60)
 
-# --------------------------
+# -------------------------------------------------------------------
 # Trading
-# --------------------------
+# -------------------------------------------------------------------
 def quantize_qty_for_notional(price: float, notional: float, step: float, min_qty: float) -> float:
     raw = notional / price
     return quantize_qty(raw, step, min_qty)
@@ -453,8 +461,10 @@ class AutoTrader:
         self.active_side = None
         self.active_qty = None
         self.regime = RegimeAnalyzer(self.b)
-        try: self.b.change_leverage(self.symbol, LEVERAGE)
-        except Exception as e: print(f"[Leverage] Warning: {e}")
+        try:
+            self.b.change_leverage(self.symbol, LEVERAGE)
+        except Exception as e:
+            print(f"[Leverage] Warning: {e}")
 
     def _flat_position_amt(self) -> float:
         pos = self.b.position_risk()
@@ -575,9 +585,9 @@ class AutoTrader:
                 print(f"[Error] {type(e).__name__}: {e}")
             time.sleep(DECISION_COOLDOWN_SEC)
 
-# --------------------------
+# -------------------------------------------------------------------
 # Account cache writer
-# --------------------------
+# -------------------------------------------------------------------
 class AccountCacheWriter:
     def __init__(self, bclient: BinanceFutures, interval_sec: int = 300):
         self.b = bclient; self.interval = max(60, interval_sec)
@@ -601,9 +611,9 @@ class AccountCacheWriter:
             put_account(bal, pnl)
             time.sleep(self.interval)
 
-# --------------------------
-# FastAPI
-# --------------------------
+# -------------------------------------------------------------------
+# FastAPI panel
+# -------------------------------------------------------------------
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 
@@ -735,9 +745,9 @@ setInterval(load, 4000); load();
 
     return app
 
-# --------------------------
+# -------------------------------------------------------------------
 # Startup wiring
-# --------------------------
+# -------------------------------------------------------------------
 ACTIVE_SYMBOL = SYMBOL  # may be changed at startup if symbol not found
 
 def start_everything():
@@ -769,9 +779,7 @@ def start_everything():
         set_notice(f"exchange_info failed for {SYMBOL}; falling back to BTCUSDT.")
 
     AccountCacheWriter(b, interval_sec=300)
-
     trader = AutoTrader(b, ACTIVE_SYMBOL)
-
     Thread(target=trader.loop, daemon=True).start()
 
 start_everything()
