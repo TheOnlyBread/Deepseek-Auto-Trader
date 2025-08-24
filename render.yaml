@@ -1,42 +1,24 @@
 services:
-  - type: worker
-    name: trader-worker
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python deepseek_binance_autotrader.py
-    envVars:
-      - key: ANALYTICS_ENABLED
-        value: "false"
-      - key: USE_TESTNET
-        value: "true"
-      # Add these in Render dashboard (Environment):
-      # - key: DEEPSEEK_API_KEY
-      #   sync: false
-      # - key: BINANCE_API_KEY
-      #   sync: false
-      # - key: BINANCE_API_SECRET
-      #   sync: false
-      # - key: DATABASE_URL      # from your Render PostgreSQL
-      #   sync: false
-
   - type: web
-    name: trader-panel
+    name: trader-onebox
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn panel:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
     envVars:
-      - key: ANALYTICS_ENABLED
+      - key: RUN_TRADER
         value: "true"
       - key: USE_TESTNET
         value: "true"
-      # Same secrets here so the panel can read data:
+      # add your real keys in the dashboard for this single service:
       # - key: DEEPSEEK_API_KEY
-      #   sync: false
       # - key: BINANCE_API_KEY
-      #   sync: false
       # - key: BINANCE_API_SECRET
-      #   sync: false
-      # - key: DATABASE_URL
-      #   sync: false
+      # optional tunables:
+      # - key: SYMBOL
+      #   value: "1000PEPEUSDT"
+      # - key: INTERVAL
+      #   value: "1m"
+      # - key: KLIMIT
+      #   value: "250"
