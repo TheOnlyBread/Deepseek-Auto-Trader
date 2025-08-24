@@ -1,11 +1,8 @@
 # deepseek_binance_autotrader.py
 # Single-process FastAPI panel + futures testnet bot (no DB). Ready for Render.com.
 # Fixes:
-#  - RegimeAnalyzer._fetch_year(): handles 12-column klines correctly.
-#  - Clearer surface of BinanceHTTPError via /api/last_error in panel.
-# Notes:
-#  - Uses USDⓈ-M Futures testnet when USE_TESTNET=true.
-#  - Keeps all state in memory; no DB required.
+#  - Sign ALL signed endpoints (GET/POST/DELETE) with HMAC, fixing HTTP 400 -1102.
+#  - RegimeAnalyzer handles 12-col klines correctly.
 
 import os
 import time
@@ -171,27 +168,28 @@ class BinanceFutures:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.25, min=0.25, max=1.8),
            retry=retry_if_exception_type(BinanceHTTPError))
     def _request(self, method: str, path: str, params: Dict[str, Any] = None, signed: bool = False):
+        """
+        Unified signer for GET/POST/DELETE. All signed endpoints receive timestamp, recvWindow, signature.
+        """
         url = self.base + path
-        params = params or {}
+        params = dict(params or {})
         where = f"{method} {path}"
+
         if signed:
             params["timestamp"] = _ts_ms()
             params.setdefault("recvWindow", 5000)
+            # Build canonical query string in key order and sign it
+            q = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
+            params["signature"] = _hmac_sha256(self.sk, q)
+
         try:
             if method == "GET":
                 resp = self.session.get(url, params=params, timeout=20)
             elif method == "POST":
-                if signed:
-                    sig = _hmac_sha256(self.sk, "&".join(f"{k}={params[k]}" for k in sorted(params.keys())))
-                    resp = self.session.post(url, params={**params, "signature": sig}, timeout=20)
-                else:
-                    resp = self.session.post(url, params=params, timeout=20)
+                # Binance expects signed params in the query string (params), not JSON body.
+                resp = self.session.post(url, params=params, timeout=20)
             elif method == "DELETE":
-                if signed:
-                    sig = _hmac_sha256(self.sk, "&".join(f"{k}={params[k]}" for k in sorted(params.keys())))
-                    resp = self.session.delete(url, params={**params, "signature": sig}, timeout=20)
-                else:
-                    resp = self.session.delete(url, params=params, timeout=20)
+                resp = self.session.delete(url, params=params, timeout=20)
             else:
                 raise ValueError("Unsupported method")
         except requests.RequestException as e:
@@ -340,7 +338,7 @@ def build_features(klines: list):
     return df, feat
 
 # -------------------------------------------------------------------
-# Regime analyzer (BTC + active symbol relationships)
+# Regime analyzer
 # -------------------------------------------------------------------
 @dataclass
 class RegimeSnapshot:
@@ -363,7 +361,6 @@ class RegimeAnalyzer:
             return self.snapshot
 
     def _fetch_year(self, symbol: str, interval: str) -> pd.DataFrame:
-        """Return OHLCV DataFrame (utc index). Handles 12-col klines."""
         end = datetime.now(tz=timezone.utc)
         start = end - timedelta(days=REGIME_LOOKBACK_DAYS)
         kl = self.b.klines_range(symbol, interval, int(start.timestamp()*1000), int(end.timestamp()*1000), 1500)
@@ -447,6 +444,12 @@ class RegimeAnalyzer:
 def quantize_qty_for_notional(price: float, notional: float, step: float, min_qty: float) -> float:
     raw = notional / price
     return quantize_qty(raw, step, min_qty)
+
+@dataclass
+class SymbolFiltersDat:
+    step_size: float
+    min_qty: float
+    tick_size: float
 
 class AutoTrader:
     def __init__(self, b: BinanceFutures, symbol: str):
