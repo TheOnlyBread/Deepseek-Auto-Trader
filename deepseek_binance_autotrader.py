@@ -1,9 +1,10 @@
 # deepseek_binance_autotrader.py
 # Render-ready FastAPI panel + Binance USDⓈ-M Futures *testnet* bot (no DB).
-# Fixes (critical):
+# Fixes:
 #   - Sign EXACT query string actually sent (no dict reordering).
 #   - Sync server time; apply time offset to all signed endpoints.
-#   - Keep previous regime + panel + trading logic.
+#   - Regime bug: use list indexer for columns (NOT set) to satisfy pandas.
+#   - Keep regime + panel + trading logic intact.
 
 import os
 import time
@@ -162,7 +163,6 @@ class BinanceFutures:
         try:
             self._sync_time()
         except Exception as e:
-            # If time sync fails at boot, we will retry lazily on first signed call.
             print(f"[TimeSync] warn: {e}")
 
     def _sync_time(self):
@@ -175,25 +175,12 @@ class BinanceFutures:
         print(f"[TimeSync] offset_ms={self.time_offset_ms}")
 
     def _signed_qs(self, params: Dict[str, Any]) -> str:
-        """
-        Build EXACT query string and signature.
-        We:
-          - add timestamp (with offset) and recvWindow,
-          - build a list of (key,value) tuples in the exact order we want,
-          - urlencode that string,
-          - sign that exact string,
-          - return final "qs&signature=..." string.
-        """
         base_params = dict(params or {})
-        # Ensure time is synced; if offset huge, resync
         if abs(self.time_offset_ms) > 60_000:
             try: self._sync_time()
             except Exception as e: print(f"[TimeSync] retry failed: {e}")
         base_params["timestamp"] = _ts_ms() + self.time_offset_ms
         base_params.setdefault("recvWindow", 5000)
-
-        # Preserve deterministic order: sort by key to avoid local dict randomness
-        # (We sign this order AND send in this order)
         items = sorted(base_params.items(), key=lambda kv: kv[0])
         qs = urlencode(items, doseq=True)
         sig = _hmac_sha256(self.sk, qs)
@@ -204,22 +191,19 @@ class BinanceFutures:
     def _request(self, method: str, path: str, params: Dict[str, Any] = None, signed: bool = False):
         url = self.base + path
         where = f"{method} {path}"
-
         try:
             if signed:
                 final_qs = self._signed_qs(params or {})
-                if method == "GET" or method == "DELETE":
+                if method in ("GET","DELETE"):
                     full = f"{url}?{final_qs}"
                     resp = self.session.request(method, full, timeout=20)
                 elif method == "POST":
-                    # Binance accepts application/x-www-form-urlencoded body OR query string.
                     headers = {"Content-Type": "application/x-www-form-urlencoded"}
                     resp = self.session.post(url, data=final_qs, headers=headers, timeout=20)
                 else:
                     raise ValueError("Unsupported method")
             else:
-                # Public, no signature
-                if method == "GET" or method == "DELETE":
+                if method in ("GET","DELETE"):
                     resp = self.session.request(method, url, params=params, timeout=20)
                 elif method == "POST":
                     resp = self.session.post(url, params=params, timeout=20)
@@ -232,7 +216,6 @@ class BinanceFutures:
         if resp.status_code >= 400:
             body = resp.text[:500]
             set_last_error(f"{where} | HTTP {resp.status_code} | {body}")
-            # Try one quick time resync if invalid timestamp
             if resp.status_code == 400 and ("-1021" in body or "Timestamp" in body):
                 try: self._sync_time()
                 except Exception: pass
@@ -400,7 +383,8 @@ class RegimeAnalyzer:
         for c in ("o","h","l","c","v"): df[c] = df[c].astype(float)
         df["dt"] = pd.to_datetime(df["ct"], unit="ms", utc=True)
         df.set_index("dt", inplace=True)
-        return df[{"o","h","l","c","v","ct"}]
+        # IMPORTANT: use a LIST here (NOT a set) to satisfy pandas indexer.
+        return df[["o","h","l","c","v","ct"]]
 
     def _compute_once(self) -> RegimeSnapshot:
         btc = self._fetch_year("BTCUSDT", REGIME_INTERVAL)
@@ -788,7 +772,6 @@ def start_everything():
 
     b = BinanceFutures(BINANCE_API_KEY, BINANCE_API_SECRET, BINANCE_FAPI_BASE)
 
-    # Check if symbol exists on the chosen env
     try:
         ex = b.exchange_info(SYMBOL)
         if not ex:
