@@ -1,9 +1,7 @@
 # deepseek_binance_autotrader.py
 # Render-ready FastAPI panel + Binance USDⓈ-M Futures *testnet* bot (no DB).
-# Updates:
-#   - DeepSeek HTTP/401/429/etc => safe "flat" signal + /api/last_error message (no crash).
-#   - Unwrap tenacity.RetryError to show root cause.
-#   - Keeps previous fixes: proper signature, time sync, pandas list indexer, no DB, panel.
+# NEW: Fallback quant strategy (EMA/RSI/vol) so you get trades even if DeepSeek is flat/error.
+#      Tunable aggressiveness via ENV. Safer logs & exact last-error surfacing.
 
 import os
 import time
@@ -26,27 +24,47 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
+
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-INTERVAL = os.getenv("INTERVAL", "1m")
-KLIMIT = int(os.getenv("KLIMIT", "250"))
+INTERVAL = os.getenv("INTERVAL", "1m")  # 1m makes fallback reactive
+KLIMIT = int(os.getenv("KLIMIT", "300"))
+
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 NOTIONAL_PER_TRADE_USDT = float(os.getenv("NOTIONAL_PER_TRADE_USDT", "50"))
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.62"))
-DECISION_COOLDOWN_SEC = int(os.getenv("DECISION_COOLDOWN_SEC", "20"))
+
+# Make trades easier to pass gates:
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.45"))  # lower = more trades
+USE_HYBRID_GATES = os.getenv("USE_HYBRID_GATES", "true").lower() == "true"
+GATE_STRICTNESS = float(os.getenv("GATE_STRICTNESS", "0.7"))  # 0..1 (lower = more trades)
+DECISION_COOLDOWN_SEC = int(os.getenv("DECISION_COOLDOWN_SEC", "15"))
 MAX_OPEN_SECONDS = int(os.getenv("MAX_OPEN_SECONDS", "3600"))
 RISK_WORKING_TYPE = "MARK_PRICE"
+
+# Fallback quant toggles
+FALLBACK_ENABLED = os.getenv("FALLBACK_ENABLED", "true").lower() == "true"
+FALLBACK_ONLY_ON_ERROR_OR_FLAT = os.getenv("FALLBACK_ONLY_ON_ERROR_OR_FLAT", "true").lower() == "true"
+FALLBACK_EMA_FAST = int(os.getenv("FALLBACK_EMA_FAST", "20"))
+FALLBACK_EMA_SLOW = int(os.getenv("FALLBACK_EMA_SLOW", "50"))
+FALLBACK_RSI_LEN = int(os.getenv("FALLBACK_RSI_LEN", "14"))
+FALLBACK_RSI_LONG_MAX = float(os.getenv("FALLBACK_RSI_LONG_MAX", "60"))   # don't chase overbought
+FALLBACK_RSI_SHORT_MIN = float(os.getenv("FALLBACK_RSI_SHORT_MIN", "40")) # don't short oversold
+FALLBACK_VOL_WIN = int(os.getenv("FALLBACK_VOL_WIN", "60"))               # bars for vol check
+FALLBACK_MIN_VOL_PCT = float(os.getenv("FALLBACK_MIN_VOL_PCT", "0.15"))   # need some action
+FALLBACK_SL_MULT = float(os.getenv("FALLBACK_SL_MULT", "1.6"))
+FALLBACK_TP_MULT = float(os.getenv("FALLBACK_TP_MULT", "2.2"))
+
+# Regime
 REGIME_LOOKBACK_DAYS = int(os.getenv("REGIME_LOOKBACK_DAYS", "365"))
 REGIME_INTERVAL = os.getenv("REGIME_INTERVAL", "1h")
-REGIME_REFRESH_MINUTES = int(os.getenv("REGIME_REFRESH_MINUTES", "10"))
-USE_HYBRID_GATES = os.getenv("USE_HYBRID_GATES", "true").lower() == "true"
-SIZE_SCALE_MIN = float(os.getenv("SIZE_SCALE_MIN", "0.35"))
-SIZE_SCALE_MAX = float(os.getenv("SIZE_SCALE_MAX", "1.25"))
+REGIME_REFRESH_MINUTES = int(os.getenv("REGIME_REFRESH_MINUTES", "8"))
+
+# Analytics / ROI
 ANALYTICS_HOST = os.getenv("ANALYTICS_HOST", "0.0.0.0")
 ANALYTICS_PORT = int(os.getenv("ANALYTICS_PORT", os.getenv("PORT", "10000")))
 RUN_TRADER = os.getenv("RUN_TRADER", "true").lower() == "true"
 EQUITY_USDT = float(os.getenv("EQUITY_USDT", "1000"))
-ROI_TRADES_PER_DAY = float(os.getenv("ROI_TRADES_PER_DAY", "20"))
-ROI_WIN_RATE = float(os.getenv("ROI_WIN_RATE", "0.54"))
+ROI_TRADES_PER_DAY = float(os.getenv("ROI_TRADES_PER_DAY", "25"))
+ROI_WIN_RATE = float(os.getenv("ROI_WIN_RATE", "0.53"))
 ROI_AVG_WIN_R = float(os.getenv("ROI_AVG_WIN_R", "0.9"))
 ROI_AVG_LOSS_R = float(os.getenv("ROI_AVG_LOSS_R", "0.8"))
 ROI_RISK_PER_TRADE_USDT = float(os.getenv("ROI_RISK_PER_TRADE_USDT", "5"))
@@ -75,7 +93,7 @@ def get_notice() -> str:
 def set_last_error(msg: str):
     global LAST_ERROR
     with LOCK:
-        LAST_ERROR = msg[:2000]  # cap
+        LAST_ERROR = msg[:2000]
 
 def get_last_error() -> str:
     with LOCK:
@@ -123,10 +141,6 @@ def _ts_ms() -> int:
 def _hmac_sha256(secret: str, msg: str) -> str:
     import hashlib, hmac
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
-
-def as_float(x, default=np.nan):
-    try: return float(x)
-    except Exception: return default
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -321,10 +335,8 @@ class DeepSeek:
         try:
             r = self.session.post(DEEPSEEK_BASE + DEEPSEEK_CHAT_PATH, data=json.dumps(payload), timeout=20)
             if r.status_code >= 400:
-                # Write exact status + trimmed body; return flat to avoid crashing loop.
                 body = r.text[:300]
                 set_last_error(f"DeepSeek decide HTTP {r.status_code} | {body}")
-                # Return a safe no-trade signal
                 return {"signal": "flat", "confidence": 0.0, "sl_pct": 0.01, "tp_pct": 0.02}
             content = r.json()["choices"][0]["message"]["content"]
             parsed = json.loads(content)
@@ -339,7 +351,7 @@ class DeepSeek:
         if sig not in ("long", "short", "flat"): sig = "flat"
         return {"signal": sig, "confidence": conf, "sl_pct": abs(slp), "tp_pct": abs(tpp)}
 
-# -------------------- Feature builders --------------------
+# -------------------- Features & Fallback --------------------
 def build_features(klines: list):
     cols12 = ["ot","o","h","l","c","v","ct","qv","n","tbv","tqv","x"]
     df = pd.DataFrame(klines, columns=cols12)
@@ -359,6 +371,64 @@ def build_features(klines: list):
         if not np.isfinite(v): feat[k] = 0.0
     return df, feat
 
+def build_vol_pct(series_ret: pd.Series, win: int) -> float:
+    vol = series_ret.rolling(win).std()
+    v = float(vol.iloc[-1])
+    return pct_rank(vol.values[np.isfinite(vol.values)], v)
+
+def fallback_quant(df: pd.DataFrame, regime_feat: Dict[str,float]) -> Dict[str, Any]:
+    """
+    EMA cross + RSI filter + minimal volatility requirement.
+    Returns dict: {signal, confidence, sl_pct, tp_pct}
+    """
+    c = df["c"].copy()
+    ema_f = c.ewm(span=FALLBACK_EMA_FAST, adjust=False).mean()
+    ema_s = c.ewm(span=FALLBACK_EMA_SLOW, adjust=False).mean()
+    rsi_v = rsi(c, FALLBACK_RSI_LEN)
+    ret = c.pct_change()
+    vol_pct = build_vol_pct(ret, min(FALLBACK_VOL_WIN, max(30, FALLBACK_VOL_WIN)))
+
+    # Cross detection
+    cross_up = ema_f.iloc[-2] <= ema_s.iloc[-2] and ema_f.iloc[-1] > ema_s.iloc[-1]
+    cross_dn = ema_f.iloc[-2] >= ema_s.iloc[-2] and ema_f.iloc[-1] < ema_s.iloc[-1]
+
+    rsi_last = float(rsi_v.iloc[-1])
+    price = float(c.iloc[-1])
+
+    # Regime tilt
+    trend_state = float(regime_feat.get("btc_trend_state", 0.0))
+    vol_env = float(regime_feat.get("btc_vol_pct", 0.5))
+    chop = float(regime_feat.get("regime_is_chop", 0.0))
+
+    # need some volatility but not extreme
+    if vol_pct < FALLBACK_MIN_VOL_PCT or chop >= (0.6 * (GATE_STRICTNESS + 0.2)):
+        return {"signal":"flat","confidence":0.0,"sl_pct":0.01,"tp_pct":0.02}
+
+    want_long = cross_up and rsi_last <= FALLBACK_RSI_LONG_MAX
+    want_short= cross_dn and rsi_last >= FALLBACK_RSI_SHORT_MIN
+
+    # regime gating (softer than LLM gate)
+    if trend_state > 0 and want_short and GATE_STRICTNESS >= 0.5:
+        want_short = False
+    if trend_state < 0 and want_long and GATE_STRICTNESS >= 0.5:
+        want_long = False
+
+    if not (want_long or want_short):
+        return {"signal":"flat","confidence":0.0,"sl_pct":0.01,"tp_pct":0.02}
+
+    # dynamic SL/TP from recent true range
+    tr = (df["h"] - df["l"]) / df["c"].replace(0, np.nan)
+    atr = tr.rolling(30).mean().iloc[-1]
+    if not np.isfinite(atr) or atr <= 0: atr = 0.003  # ~0.3%
+
+    sl_pct = float(np.clip(FALLBACK_SL_MULT * atr, 0.001, 0.02))
+    tp_pct = float(np.clip(FALLBACK_TP_MULT * atr, sl_pct*1.15, 0.05))
+
+    if want_long:
+        return {"signal":"long","confidence":0.55,"sl_pct":sl_pct,"tp_pct":tp_pct}
+    else:
+        return {"signal":"short","confidence":0.55,"sl_pct":sl_pct,"tp_pct":tp_pct}
+
 # -------------------- Regime analyzer --------------------
 @dataclass
 class RegimeSnapshot:
@@ -367,7 +437,7 @@ class RegimeSnapshot:
     info: Dict[str, Any]
 
 class RegimeAnalyzer:
-    def __init__(self, client: BinanceFutures):
+    def __init__(self, client: 'BinanceFutures'):
         self.b = client
         self.snapshot: Optional[RegimeSnapshot] = None
         self.lock = Lock()
@@ -391,8 +461,7 @@ class RegimeAnalyzer:
         for c in ("o","h","l","c","v"): df[c] = df[c].astype(float)
         df["dt"] = pd.to_datetime(df["ct"], unit="ms", utc=True)
         df.set_index("dt", inplace=True)
-        # LIST (not set) for pandas indexer:
-        return df[["o","h","l","c","v","ct"]]
+        return df[["o","h","l","c","v","ct"]]  # list indexer (not set)
 
     def _compute_once(self) -> RegimeSnapshot:
         btc = self._fetch_year("BTCUSDT", REGIME_INTERVAL)
@@ -430,7 +499,8 @@ class RegimeAnalyzer:
         tmp["rsi14"] = rsi(tmp["c"], 14); btc_rsi = float(tmp["rsi14"].iloc[-1])
 
         trend_mag = abs(float(btc_trend_raw.iloc[-1]))
-        is_chop = 1.0 if (trend_mag < 0.0015 and vol_pct > 0.55) else 0.0
+        # Softer “chop” threshold with strictness
+        is_chop = 1.0 if (trend_mag < (0.0012 + 0.0010*GATE_STRICTNESS) and vol_pct > (0.50 + 0.10*GATE_STRICTNESS)) else 0.0
 
         feat = {
             "btc_trend_state": float(btc_trend_state),
@@ -461,18 +531,18 @@ class RegimeAnalyzer:
             time.sleep(REGIME_REFRESH_MINUTES * 60)
 
 # -------------------- Trading --------------------
-def quantize_qty_for_notional(price: float, notional: float, step: float, min_qty: float) -> float:
-    raw = notional / price
-    return quantize_qty(raw, step, min_qty)
-
 @dataclass
 class SymbolFiltersDat:
     step_size: float
     min_qty: float
     tick_size: float
 
+def quantize_qty_for_notional(price: float, notional: float, step: float, min_qty: float) -> float:
+    raw = notional / price
+    return quantize_qty(raw, step, min_qty)
+
 class AutoTrader:
-    def __init__(self, b: BinanceFutures, symbol: str):
+    def __init__(self, b: 'BinanceFutures', symbol: str):
         self.b = b
         self.symbol = symbol
         ex = self.b.exchange_info(self.symbol)
@@ -493,7 +563,10 @@ class AutoTrader:
         pos = self.b.position_risk()
         for p in pos:
             if p.get("symbol") == self.symbol:
-                return as_float(p.get("positionAmt", "0"), 0.0)
+                # positionAmt is negative when short
+                v = p.get("positionAmt", "0")
+                try: return float(v)
+                except: return 0.0
         return 0.0
 
     def _cleanup_if_flat(self):
@@ -504,8 +577,10 @@ class AutoTrader:
 
     def _dynamic_notional(self, base_notional: float, regime_feat: Dict[str, float]) -> float:
         vol_pct = float(regime_feat.get("btc_vol_pct", 0.5))
-        scale = SIZE_SCALE_MAX - (SIZE_SCALE_MAX - SIZE_SCALE_MIN) * vol_pct
-        return max(5.0, base_notional * float(np.clip(scale, SIZE_SCALE_MIN, SIZE_SCALE_MAX)))
+        # more size when volatility percentile is lower (trendier)
+        scale = (1.0 - 0.6*vol_pct) * (1.0 - 0.4*GATE_STRICTNESS)
+        scale = float(np.clip(scale, 0.6, 1.4))
+        return max(5.0, base_notional * scale)
 
     def _hybrid_gate(self, desired_signal: str, regime_feat: Dict[str, float]) -> str:
         if not USE_HYBRID_GATES: return desired_signal
@@ -513,9 +588,11 @@ class AutoTrader:
         volp  = float(regime_feat.get("btc_vol_pct", 0.5))
         corr  = float(regime_feat.get("corr7", 0.0))
         chop  = float(regime_feat.get("regime_is_chop", 0.0))
-        if chop >= 0.5 and (volp >= 0.55 or abs(corr) <= 0.15): return "flat"
-        if trend < 0 and volp >= 0.6 and desired_signal == "long": return "flat"
-        if trend > 0 and corr >= 0.2 and desired_signal == "short": return "flat"
+        # We scale the strictness thresholds so you can loosen from env
+        if chop >= (0.55 + 0.2*GATE_STRICTNESS) and (volp >= (0.55 + 0.1*GATE_STRICTNESS) or abs(corr) <= 0.15):
+            return "flat"
+        if trend < 0 and volp >= (0.60 + 0.10*GATE_STRICTNESS) and desired_signal == "long": return "flat"
+        if trend > 0 and corr >= (0.20 - 0.15*(1-GATE_STRICTNESS)) and desired_signal == "short": return "flat"
         return desired_signal
 
     def _place_entry_and_exits(self, signal: str, price: float, sl_pct: float, tp_pct: float, notional: float):
@@ -528,13 +605,16 @@ class AutoTrader:
         self.position_open_time = time.time()
 
         if signal == "long":
-            sl_price = quantize_price(price * (1 - sl_pct), self.filters.tick_size)
-            tp_price = quantize_price(price * (1 + tp_pct), self.filters.tick_size)
+            sl_price = price * (1 - sl_pct)
+            tp_price = price * (1 + tp_pct)
             sl_side = tp_side = "SELL"
         else:
-            sl_price = quantize_price(price * (1 + sl_pct), self.filters.tick_size)
-            tp_price = quantize_price(price * (1 - tp_pct), self.filters.tick_size)
+            sl_price = price * (1 + sl_pct)
+            tp_price = price * (1 - tp_pct)
             sl_side = tp_side = "BUY"
+
+        sl_price = quantize_price(sl_price, self.filters.tick_size)
+        tp_price = quantize_price(tp_price, self.filters.tick_size)
 
         self.b.new_order(symbol=self.symbol, side=sl_side, type="STOP_MARKET",
                          stopPrice=f"{sl_price}", closePosition="true", workingType=RISK_WORKING_TYPE)
@@ -555,8 +635,8 @@ class AutoTrader:
 
     def step(self):
         kl = self.b.klines(self.symbol, INTERVAL, limit=KLIMIT)
-        if not kl or len(kl) < 50: raise LogicSkip("Not enough bars")
-        _, feat = build_features(kl); price = feat["price"]
+        if not kl or len(kl) < 60: raise LogicSkip("Not enough bars")
+        df, feat = build_features(kl); price = feat["price"]
 
         self._close_if_timeout(price)
         if abs(self._flat_position_amt()) > 0: raise LogicSkip("Position active; waiting")
@@ -567,22 +647,50 @@ class AutoTrader:
         all_feat = {**feat}
         for k, v in snap.features.items(): all_feat[f"X_{k}"] = float(v)
 
+        # 1) Ask DeepSeek
         decision = DeepSeek(DEEPSEEK_API_KEY).decide(all_feat)
-        sig, conf = decision["signal"], decision["confidence"]
-        slp = max(0.001, decision["sl_pct"]); tpp = max(0.001, decision["tp_pct"])
-        gated_sig = self._hybrid_gate(sig, snap.features)
+        llm_sig, llm_conf = decision["signal"], float(decision["confidence"])
+        slp = max(0.001, float(decision["sl_pct"]))
+        tpp = max(0.001, float(decision["tp_pct"]))
+        gated_sig = self._hybrid_gate(llm_sig, snap.features)
 
-        put_decision({"ts": time.time(), "price": price, "llm_signal": sig,
-                      "confidence": conf, "gated_signal": gated_sig,
-                      "sl_pct": slp, "tp_pct": tpp})
+        use_fallback = False
+        if FALLBACK_ENABLED:
+            if FALLBACK_ONLY_ON_ERROR_OR_FLAT:
+                # if last error mentions DeepSeek or gate flattened or conf low
+                last_err = get_last_error()
+                if (llm_sig == "flat") or (llm_conf < CONFIDENCE_THRESHOLD) or ("DeepSeek" in last_err):
+                    use_fallback = True
+            else:
+                if (llm_sig == "flat") or (llm_conf < CONFIDENCE_THRESHOLD):
+                    use_fallback = True
 
-        print(f"[Decision] LLM={sig}({conf:.3f}) → Gate={gated_sig} | sl={slp:.3f} tp={tpp:.3f} | px={price}")
+        chosen = {"signal": gated_sig, "confidence": llm_conf, "sl_pct": slp, "tp_pct": tpp, "source":"llm"}
 
-        if gated_sig == "flat" or conf < CONFIDENCE_THRESHOLD:
-            raise LogicSkip("No trade (confidence low / gate flat)")
+        # 2) Fallback quant if needed
+        if use_fallback:
+            fq = fallback_quant(df, snap.features)
+            if fq["signal"] in ("long","short"):
+                chosen = {**fq, "source":"fallback"}
+                # run hybrid gate lightly again
+                chosen["signal"] = self._hybrid_gate(chosen["signal"], snap.features)
+
+        put_decision({"ts": time.time(), "price": price,
+                      "llm_signal": llm_sig, "confidence": llm_conf,
+                      "gated_signal": chosen["signal"], "sl_pct": chosen["sl_pct"],
+                      "tp_pct": chosen["tp_pct"], "src": chosen.get("source","llm")})
+
+        print(f"[Decision] src={chosen.get('source')} llm={llm_sig}({llm_conf:.3f}) "
+              f"→ use={chosen['signal']} | sl={chosen['sl_pct']:.3f} tp={chosen['tp_pct']:.3f} | px={price}")
+
+        if chosen["signal"] == "flat":
+            raise LogicSkip("No trade (flat after LLM/fallback)")
+
+        if chosen.get("source") == "llm" and llm_conf < CONFIDENCE_THRESHOLD:
+            raise LogicSkip("LLM confidence below threshold")
 
         dyn_notional = self._dynamic_notional(NOTIONAL_PER_TRADE_USDT, snap.features)
-        self._place_entry_and_exits(gated_sig, price, slp, tpp, dyn_notional)
+        self._place_entry_and_exits(chosen["signal"], price, chosen["sl_pct"], chosen["tp_pct"], dyn_notional)
         time.sleep(1); self._cleanup_if_flat()
 
     def loop(self):
@@ -609,7 +717,7 @@ class AutoTrader:
 
 # -------------------- Account cache writer --------------------
 class AccountCacheWriter:
-    def __init__(self, bclient: BinanceFutures, interval_sec: int = 300):
+    def __init__(self, bclient: 'BinanceFutures', interval_sec: int = 300):
         self.b = bclient; self.interval = max(60, interval_sec)
         Thread(target=self._loop, daemon=True).start()
 
@@ -649,6 +757,7 @@ h1{margin:0 0 12px 0} table{width:100%;border-collapse:collapse} th,td{padding:8
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
 .notice{color:#555;margin:8px 0}
 .err{color:#b00;white-space:pre-wrap}
+small{color:#666}
 </style></head><body>
 <h1>DeepSeek × Binance AutoTrader</h1>
 <div class="notice" id="notice"></div>
@@ -659,7 +768,8 @@ h1{margin:0 0 12px 0} table{width:100%;border-collapse:collapse} th,td{padding:8
 </div>
 <div class="card">
   <h3>Latest Decisions</h3>
-  <table id="dec"><thead><tr><th>Time</th><th>Price</th><th>LLM</th><th>Conf</th><th>Gate</th></tr></thead><tbody></tbody></table>
+  <table id="dec"><thead><tr><th>Time</th><th>Price</th><th>LLM</th><th>Conf</th><th>Gate</th><th>Src</th></tr></thead><tbody></tbody></table>
+  <small>Src=llm or fallback</small>
 </div>
 <div class="card">
   <h3>Regime Snapshot</h3>
@@ -700,8 +810,9 @@ async function load(){
       <td>${new Date(x.ts*1000).toLocaleTimeString()}</td>
       <td>${x.price}</td>
       <td>${x.llm_signal}</td>
-      <td>${x.confidence.toFixed(3)}</td>
+      <td>${(x.confidence ?? 0).toFixed(3)}</td>
       <td>${x.gated_signal}</td>
+      <td>${x.src || ''}</td>
     </tr>`);
   });
   document.getElementById('regime').textContent = JSON.stringify(g, null, 2);
